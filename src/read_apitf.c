@@ -17,6 +17,16 @@
 
 #include "apit.h"   /* FileHeader, VarDir, ST_* codes */
 
+struct map_info {
+  void    *addr;        /* base address returned by mmap / MapViewOfFile */
+#ifdef _WIN32
+HANDLE   hm;          /* Windows mapping handle                        */
+#else
+int      fd;          /* POSIX file descriptor                          */
+#endif
+};
+
+
 /* ------------------------------------------------------------------ */
 /* mmap helpers (read-only)                                           */
 #ifdef _WIN32
@@ -61,26 +71,29 @@ static void *map_ro(const char *path, uint64_t *len_out, int *fd_out)
 #ifdef _WIN32
 static void unmap_ro_finalizer(SEXP ext)
 {
-  void  *addr = R_ExternalPtrAddr(ext);
-  HANDLE hm   = (HANDLE) R_ExternalPtrTag(ext);
-
-  if (addr && hm) {
-    UnmapViewOfFile(addr);
-    CloseHandle(hm);
+  struct map_info *info = (struct map_info *) R_ExternalPtrAddr(ext);
+  if (info) {
+    if (info->addr && info->hm) {
+      UnmapViewOfFile(info->addr);
+      CloseHandle(info->hm);
+    }
+    free(info);
+    R_ClearExternalPtr(ext);
   }
-  R_ClearExternalPtr(ext);
 }
 #else
 static void unmap_ro_finalizer(SEXP ext)
 {
-  void   *addr = R_ExternalPtrAddr(ext);
-  int      fd  = (int) (uintptr_t) R_ExternalPtrTag(ext);
-
-  if (addr) { munmap(addr, 0); }
-  if (fd)   { close(fd); }
-  R_ClearExternalPtr(ext);
+  struct map_info *info = (struct map_info *) R_ExternalPtrAddr(ext);
+  if (info) {
+    if (info->addr) { munmap(info->addr, 0); }
+    if (info->fd >= 0) { close(info->fd); }
+    free(info);
+    R_ClearExternalPtr(ext);
+  }
 }
 #endif
+
 
 
 /* ------------------------------------------------------------------ */
@@ -148,6 +161,20 @@ SEXP C_read_apitf(SEXP path_, SEXP vars_)
   int fd;
   uint8_t *base = (uint8_t *) map_ro(path, &fsize, &fd);
 #endif
+  /* save mapping info for the finaliser */
+  struct map_info *info = (struct map_info *) malloc(sizeof *info);
+  if (!info) {
+    error("read_apitf: out of memory");
+  }
+
+  info->addr = base;
+#ifdef _WIN32
+  info->hm   = hm;
+#else
+  info->fd   = fd;
+#endif
+
+
   if (!base) {
     error("read_apitf: cannot map '%s': %s", path, strerror(errno));
   }
@@ -219,23 +246,12 @@ SEXP C_read_apitf(SEXP path_, SEXP vars_)
   }
 
   Rf_setAttrib(res, R_NamesSymbol, nms);
-  SEXP token = PROTECT(R_MakeExternalPtr(base, R_NilValue, R_NilValue));
+  /* keep mapping alive and register finaliser */
+  SEXP token = PROTECT(R_MakeExternalPtr(info, R_NilValue, R_NilValue));
 
-#ifdef _WIN32
-  /* store the Windows mapping handle in the extptr tag */
-  R_SetExternalPtrTag(token, (SEXP) hm);
-#else
-  /* store the file descriptor in the extptr tag */
-  R_SetExternalPtrTag(token, (SEXP) (uintptr_t) fd);
-#endif
+  R_RegisterCFinalizerEx(token, unmap_ro_finalizer, TRUE); /* run at GC & exit */
+  Rf_setAttrib(res, Rf_install(".apit_map"), token);       /* hide the extptr */
 
-  /* register finalizer so mmap is released when res is gc-d */
-  R_RegisterCFinalizerEx(token,
-                         unmap_ro_finalizer, /* defined earlier        */
-  TRUE);              /* also run at R shutdown */
-
-  /* attach extptr as hidden attribute; any name works */
-  Rf_setAttrib(res, Rf_install(".apit_map"), token);
 
 
   /* ---- unprotect & return ---------------------------------------- */
