@@ -7,7 +7,9 @@
 write_apitf(schema, data, dest, delim = "\\t", tax_year = 2024L, nThread = 1L)
 }
 \arguments{
-\item{schema, data, dest}{Paths (character scalar)}
+\item{schema, data, dest}{Paths (character scalar). If \code{data} is a data frame
+it is taken to be the data as read; if it is a string, it is taken to be (tab-delimited)
+file from which data is to be read.}
 
 \item{delim}{Single-character delimiter (default \code{"\t"})}
 

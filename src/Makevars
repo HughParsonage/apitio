@@ -1,0 +1,5 @@
+PKG_CFLAGS = $(SHLIB_OPENMP_CFLAGS) -std=gnu11
+PKG_LIBS = $(SHLIB_OPENMP_CFLAGS)
+
+
+# PKG_CFLAGS   = -O3 -std=c17 -Wall -Wextra -march=native -mno-avx512 -mprefer-vector-width=256
