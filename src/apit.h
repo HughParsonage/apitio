@@ -30,6 +30,13 @@
 #include <unistd.h>
 #endif
 
+// Pull in all the x86 SIMD intrinsics
+#if defined(__GNUC__) || defined(__clang__)
+#include <immintrin.h>
+#elif defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 /* ---- on-disk structs (packed) ---- */
 #pragma pack(push, 1)
 

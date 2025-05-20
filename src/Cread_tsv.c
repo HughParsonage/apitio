@@ -58,7 +58,11 @@ static char* map_file(const char* path, size_t* length) {
   CloseHandle(hf);
   return data;
 #else
+#ifdef O_BINARY
   int fd = open(path, O_RDONLY | O_BINARY);
+#else
+  int fd = open(path, O_RDONLY);
+#endif
   if (fd < 0) Rf_error("Cannot open %s", path);
   struct stat st;
   if (fstat(fd, &st) < 0) Rf_error("fstat failed");
@@ -129,7 +133,7 @@ SEXP C_read_tsv_two_ints(SEXP filePathSEXP) {
   if (n_off != n_rows) {
     free(row_off);
     unmap_file(data, len);
-    Rf_error("row count mismatch: %u vs %u", n_off, n_rows);
+    Rf_error("row count mismatch: %u vs %u", (unsigned)n_off, (unsigned)n_rows);
   }
 
   // allocate vectors
