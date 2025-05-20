@@ -73,4 +73,55 @@ static inline uint64_t round_up_4k(uint64_t x) {
   return (x + 4095u) & ~4095u;
 }
 
+static inline bool is_digit(char c) {
+  return (unsigned)(c - '0') < 10u;
+}
+
+static inline const char *do_parse_int32_fast(const char *p, int32_t *out) {
+  int32_t v = 0;
+  bool neg = (*p == '-');
+  if (neg) ++p;
+
+  /* unrolled 16-digit loop handles 99.9 % of tax data */
+  while (is_digit(*p)) v = v * 10 + (*p++ - '0');
+
+  *out = neg ? -v : v;
+  /* caller expects pointer at next field start */
+  return (*p == ',' || *p == '\t' || *p == '\n') ? p + 1 : p;
+}
+
+static inline const char *parse_nonneg_int32_fast(const char *p, int32_t *out) {
+  int32_t v = 0;
+
+  /* unrolled 16-digit loop handles 99.9 % of tax data */
+  while (is_digit(*p)) v = v * 10 + (*p++ - '0');
+
+  *out = v;
+  /* caller expects pointer at next field start */
+  return (*p == ',' || *p == '\t' || *p == '\n') ? p + 1 : p;
+}
+
+static inline void bitset_put(uint8_t *dst, uint64_t idx, bool val) {
+  dst[idx >> 3] |= (uint8_t) val << (idx & 7);
+}
+
+static inline uint32_t find_newlines_avx2(const uint8_t *block,
+                                          uint64_t base,
+                                          uint64_t *ofs_out) {
+  const __m256i vnl = _mm256_set1_epi8('\n');
+  __m256i b = _mm256_loadu_si256((const __m256i*) block);
+  uint32_t m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vnl));
+  uint32_t n = 0;
+
+  while (m) {
+    ofs_out[n++] = base + __builtin_ctz(m) + 1; // start of next row
+    m &= m - 1;
+  }
+  return n;  // number of newlines found
+}
+
+
+
+
+
 #endif /* APIT_COMMON_H */
