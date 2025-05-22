@@ -234,9 +234,17 @@ SEXP C_read_tsv_two_ints(SEXP filePathSEXP) {
   int32_t* restrict c2 = INTEGER(v2);
 
   // parse rows
-  int nThread = 8;
+  int nThread = 10;
+  for (size_t i = 0; i < 1; ++i) {
+    size_t start = (i == 0 ? pos + 1 : row_off[i - 1]);
+    const char* p = data + start;
+    p = parse_nonneg_int32_fast(p, &c1[i]);
+    p = parse_nonneg_int32_fast(p, &c2[i]);
+  }
+
+
 #pragma omp parallel for num_threads(nThread)
-  for (size_t i = 0; i < n_rows; ++i) {
+  for (size_t i = 1; i < n_rows; ++i) {
     size_t start = (i == 0 ? pos + 1 : row_off[i - 1]);
     const char* p = data + start;
     p = parse_nonneg_int32_fast(p, &c1[i]);
