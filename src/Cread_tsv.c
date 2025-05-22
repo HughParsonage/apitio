@@ -7,6 +7,16 @@ SEXP Cread_tsv(SEXP file_tsv,
   }
   return R_NilValue;
 }
+#include <time.h>
+
+void tictok(const char * msg, clock_t * t0) {
+  clock_t t = clock();
+  double time_taken = (double)t - (double)t0[0];
+  Rprintf("%.3f %s", time_taken/CLOCKS_PER_SEC, msg);
+  Rprintf("\n");
+  t0[0] = t;
+}
+
 
 /*
  * High-performance TSV parser for salary, age, gender using SIMD (AVX2) + OpenMP
@@ -81,6 +91,74 @@ static void unmap_file(char* data, size_t length) {
 #endif
 }
 
+#include <immintrin.h>
+#include <stddef.h>
+#include <stdint.h>
+
+// Count newlines using AVX2 + popcount
+static size_t count_rows_avx2(const char *data, size_t len) {
+  size_t i = 0, count = 0;
+
+  // Prepare a vector full of '\n'
+  const __m256i vnl = _mm256_set1_epi8('\n');
+
+  // Process 32 bytes per iteration
+  for (; i + 32 <= len; i += 32) {
+    __m256i chunk = _mm256_loadu_si256((const __m256i*)(data + i));
+    // Compare each byte to '\n', build a 32-bit mask
+    uint32_t mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, vnl));
+    // Count set bits = number of newlines
+    count += __builtin_popcount(mask);
+  }
+
+  // Handle any remaining bytes
+  for (; i < len; ++i) {
+    if (data[i] == '\n') {
+      ++count;
+    }
+  }
+
+  return count;
+}
+
+static size_t count_rows_avx2_omp(const char *data, size_t len) {
+  size_t total = 0;
+  const __m256i vnl = _mm256_set1_epi8('\n');
+
+#pragma omp parallel
+{
+  size_t local = 0;
+  int tid      = omp_get_thread_num();
+  int nthreads = omp_get_num_threads();
+
+  // carve the buffer into nthreads chunks
+  size_t chunk_size = (len + nthreads - 1) / nthreads;
+  size_t start = tid * chunk_size;
+  size_t end   = start + chunk_size;
+  if (end > len) end = len;
+
+  // AVX2‐fast pass over aligned 32‐byte blocks
+  size_t i = start;
+  // align i up to the next multiple of 32 if needed
+  size_t aligned_start = (i + 31) & ~31;
+  for (; i + 32 <= end; i += 32) {
+    __m256i chunk = _mm256_loadu_si256((const __m256i*)(data + i));
+    uint32_t mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, vnl));
+    local += __builtin_popcount(mask);
+  }
+  // tail
+  for (; i < end; ++i) {
+    if (data[i] == '\n') ++local;
+  }
+
+#pragma omp atomic
+  total += local;
+}
+
+return total;
+}
+
+
 
 SEXP C_read_tsv_two_ints(SEXP filePathSEXP) {
   const char* path = CHAR(STRING_ELT(filePathSEXP, 0));
@@ -103,11 +181,17 @@ SEXP C_read_tsv_two_ints(SEXP filePathSEXP) {
   free(hdr);
 
   // count rows
+  clock_t tempi = clock();
   size_t n_rows = 0;
+  if (0) {
+    // 1.751s / 1 billion rows
 #pragma omp parallel for reduction(+:n_rows)
-  for (size_t i = pos + 1; i < len; ++i) if (data[i] == '\n') n_rows++;
-
-
+    for (size_t i = pos + 1; i < len; ++i) if (data[i] == '\n') n_rows++;
+  } else {
+    // 1.511s / 1 billion rows
+    n_rows = count_rows_avx2_omp(data, len) - 1;
+  }
+  tictok("n_rows took: ", &tempi);
 
   size_t data_start = pos + 1;
   size_t data_len   = len - data_start;
@@ -136,6 +220,7 @@ SEXP C_read_tsv_two_ints(SEXP filePathSEXP) {
     Rf_error("row count mismatch: %u vs %u", (unsigned)n_off, (unsigned)n_rows);
   }
 
+
   // allocate vectors
   SEXP v1 = PROTECT(Rf_allocVector(INTSXP, n_rows));
   SEXP v2 = PROTECT(Rf_allocVector(INTSXP, n_rows));
@@ -143,7 +228,8 @@ SEXP C_read_tsv_two_ints(SEXP filePathSEXP) {
   int32_t* restrict c2 = INTEGER(v2);
 
   // parse rows
-#pragma omp parallel for schedule(static)
+  int nThread = 8;
+#pragma omp parallel for num_threads(nThread)
   for (size_t i = 0; i < n_rows; ++i) {
     size_t start = (i == 0 ? pos + 1 : row_off[i - 1]);
     const char* p = data + start;
@@ -174,3 +260,8 @@ SEXP C_read_tsv_two_ints(SEXP filePathSEXP) {
   UNPROTECT(6);
   return df;
 }
+
+
+
+
+

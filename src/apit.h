@@ -63,6 +63,14 @@ typedef struct {
   uint8_t  reserved[6];
 } VarDir;
 
+typedef struct {
+  unsigned int z_tfn;
+  unsigned int i_salwag;
+  unsigned int c_resident : 1;
+  unsigned int c_is_male : 1;
+  // unsigned int
+} ApitPerson;
+
 #pragma pack(pop)
 
 /* ---- storage_type codes ---- */
