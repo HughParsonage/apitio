@@ -47,7 +47,10 @@ void tictok(const char * msg, clock_t * t0) {
 // Memory-map file cross-platform
 static char* map_file(const char* path, size_t* length) {
 #ifdef _WIN32
-  HANDLE hf = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  HANDLE hf = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                          // FILE_ATTRIBUTE_NORMAL,
+                          FILE_FLAG_SEQUENTIAL_SCAN,
+                          NULL);
   if (hf == INVALID_HANDLE_VALUE) {
     Rf_error("Cannot open %s", path);
   }
@@ -66,6 +69,9 @@ static char* map_file(const char* path, size_t* length) {
   }
   CloseHandle(fm);
   CloseHandle(hf);
+  // These lines I thought would save time but don't.
+  // // WIN32_MEMORY_RANGE_ENTRY range = { data, (SIZE_T)length };
+  // // PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
   return data;
 #else
 #ifdef O_BINARY
