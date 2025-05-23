@@ -146,7 +146,7 @@ static size_t count_rows_avx2_omp(const char *data, size_t len) {
   // AVX2‐fast pass over aligned 32‐byte blocks
   size_t i = start;
   // align i up to the next multiple of 32 if needed
-  size_t aligned_start = (i + 31) & ~31;
+  // size_t aligned_start = (i + 31) & ~31;
   for (; i + 32 <= end; i += 32) {
     __m256i chunk = _mm256_loadu_si256((const __m256i*)(data + i));
     uint32_t mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, vnl));
@@ -204,22 +204,81 @@ SEXP C_read_tsv_two_ints(SEXP filePathSEXP) {
 
   // offsets array
   uint64_t* row_off = malloc(n_rows * sizeof(uint64_t));
-  size_t n_off = 0;
+  // --- begin production‐ready offset building ---
 
-  // full 32-byte blocks
-  size_t full = (len / 32) * 32;
-  for (size_t i = 0; i < full; i += 32) {
-    n_off += find_newlines_avx2(
-      (const uint8_t*)(data + data_start + i),
-      data_start + i,
-      row_off + n_off
+  // 1. Compute blocks & tail
+  size_t total_blocks    = len / 32;
+  size_t remainder_start = total_blocks * 32;
+  int    nThread         = omp_get_max_threads();
+
+  // 2. Per‐thread count of newlines in the aligned 32 B blocks
+  size_t *counts = malloc(nThread * sizeof *counts);
+
+#pragma omp parallel
+{
+  int    tid        = omp_get_thread_num();
+  size_t start_blk  = (total_blocks * tid)   / nThread;
+  size_t   end_blk  = (total_blocks * (tid+1)) / nThread;
+  size_t local_cnt  = 0;
+
+  for (size_t b = start_blk; b < end_blk; ++b) {
+    // absolute file offset of this chunk:
+    size_t off = data_start + b * 32;
+    // only count (NULL → no writes):
+    local_cnt += find_newlines_avx2(
+      (const uint8_t*)(data + off),
+      off,          // <-- CORRECT: use file offset, not “32”
+      NULL
     );
   }
-  // remainder
-  for (size_t i = full; i < data_len; ++i) {
-    if (data[data_start + i] == '\n')
-      row_off[n_off++] = data_start + i + 1;
+  counts[tid] = local_cnt;
+}
+
+// 3. Build prefix‐sum so each thread knows where to write into row_off[]
+size_t *prefix = malloc(nThread * sizeof *prefix);
+size_t sum_off = 0;
+for (int t = 0; t < nThread; ++t) {
+  prefix[t] = sum_off;
+  sum_off  += counts[t];
+}
+
+// 4. In parallel, actually write the offsets
+#pragma omp parallel
+{
+  int    tid       = omp_get_thread_num();
+  size_t start_blk = (total_blocks * tid)   / nThread;
+  size_t   end_blk = (total_blocks * (tid+1)) / nThread;
+  size_t write_idx = prefix[tid];
+
+  for (size_t b = start_blk; b < end_blk; ++b) {
+    size_t off = data_start + b * 32;
+    write_idx += find_newlines_avx2(
+      (const uint8_t*)(data + off),
+      off,                // <-- CORRECTED here too
+      row_off + write_idx
+    );
   }
+}
+
+// 5. Handle the final “remainder” bytes serially
+size_t n_off = sum_off;
+for (size_t i = remainder_start; i < data_len; ++i) {
+  if (data[data_start + i] == '\n') {
+    row_off[n_off++] = data_start + i + 1;
+  }
+}
+
+// sanity check: n_off must equal n_rows
+if (n_off != n_rows) {
+  Rf_error("row count mismatch: %zu vs %zu", n_off, n_rows);
+}
+
+// cleanup
+free(counts);
+free(prefix);
+// --- end offset building ---
+
+
   if (n_off != n_rows) {
     free(row_off);
     unmap_file(data, len);
@@ -234,7 +293,7 @@ SEXP C_read_tsv_two_ints(SEXP filePathSEXP) {
   int32_t* restrict c2 = INTEGER(v2);
 
   // parse rows
-  int nThread = 10;
+  int nThreadz = 10;
   for (size_t i = 0; i < 1; ++i) {
     size_t start = (i == 0 ? pos + 1 : row_off[i - 1]);
     const char* p = data + start;
@@ -243,7 +302,7 @@ SEXP C_read_tsv_two_ints(SEXP filePathSEXP) {
   }
 
 
-#pragma omp parallel for num_threads(nThread)
+#pragma omp parallel for num_threads(nThreadz)
   for (size_t i = 1; i < n_rows; ++i) {
     size_t start = (i == 0 ? pos + 1 : row_off[i - 1]);
     const char* p = data + start;

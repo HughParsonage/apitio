@@ -129,7 +129,9 @@ static inline uint32_t find_newlines_avx2(const uint8_t *block,
   uint32_t n = 0;
 
   while (m) {
-    ofs_out[n++] = base + __builtin_ctz(m) + 1; // start of next row
+    uint32_t idx = base + __builtin_ctz(m) + 1;
+    if (ofs_out) ofs_out[n] = idx; // start of next row
+    ++n;
     m &= m - 1;
   }
   return n;  // number of newlines found
