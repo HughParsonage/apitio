@@ -3,5 +3,7 @@
 export(field_schema)
 export(field_schemata)
 export(read_apitf)
+export(read_tsv_with_schemata)
+export(test_rtsv)
 export(write_apitf)
 useDynLib(apitio, .registration=TRUE)

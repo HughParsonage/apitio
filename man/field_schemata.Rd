@@ -12,6 +12,7 @@ field_schema(
   required = FALSE,
   i_min = NULL,
   i_max = NULL,
+  na_strings = c("NA", "?"),
   valid = NULL
 )
 }
@@ -25,6 +26,8 @@ field_schema(
 \item{required}{(bool) whether the name is required (i.e. whether its absence should raise an error).}
 
 \item{i_min, i_max}{If the type is an integer type, the range of allowable integers.}
+
+\item{na_strings}{A vector of strings that should be set to the missing value.}
 
 \item{valid}{A vector of strings that are valid for this field.}
 }

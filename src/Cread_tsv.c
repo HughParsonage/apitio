@@ -152,7 +152,7 @@ return total;
 }
 
 int n_columns(const char *data, size_t len, const char sep, int col_widths[MAX_COLUMNS]) {
-  int n_cols = 0;
+  int n_cols = 1;
   for (int j = 0; j < len; ++j) {
     if (data[j] == '\n') {
       break;
@@ -160,7 +160,7 @@ int n_columns(const char *data, size_t len, const char sep, int col_widths[MAX_C
     if (data[j] == sep) {
       ++n_cols;
     }
-    col_widths[n_cols % MAX_COLUMNS]++;
+    col_widths[(n_cols - 1) % MAX_COLUMNS]++;
   }
   return n_cols;
 }
@@ -498,6 +498,9 @@ void RSchema_to_Schemata(SEXP RSchema, FieldSchemata *field_schemata) {
     error("Memory allocation failed for %d FieldSchema entries", n);
   }
 
+  SEXP ListNames = getAttrib(RSchema, R_NamesSymbol);
+  bool has_names = ListNames != R_NilValue;
+
   for (int i = 0; i < n; i++) {
     SEXP elt = VECTOR_ELT(RSchema, i);
     if (!isNewList(elt)) {
@@ -505,18 +508,22 @@ void RSchema_to_Schemata(SEXP RSchema, FieldSchemata *field_schemata) {
     }
 
     /* --- name (required) --- */
-    SEXP nameSEXP = getListElement(elt, "name");
-    if (!isString(nameSEXP) || xlength(nameSEXP) != 1) {
-      error("Schema element %d: 'name' must be a single string", i + 1);
+    if (has_names) {
+      FS[i].name = strdup(CHAR(STRING_ELT(ListNames, i)));
+    } else {
+      SEXP nameSEXP = getListElement(elt, "name");
+      if (!isString(nameSEXP) || xlength(nameSEXP) != 1) {
+        error("Schema element %d: 'name' must be a single string", i + 1);
+      }
+      FS[i].name = strdup(CHAR(STRING_ELT(nameSEXP, 0)));
     }
-    FS[i].name = strdup(CHAR(STRING_ELT(nameSEXP, 0)));
 
     /* --- type (required) --- */
     SEXP typeSEXP = getListElement(elt, "type");
     if (!isInteger(typeSEXP) || xlength(typeSEXP) != 1) {
       error("Schema for '%s': 'type' must be a single integer", FS[i].name);
     }
-    FS[i].type = (TypeCode) INTEGER(typeSEXP)[0];
+    FS[i].type = (TypeCode) INTEGER(typeSEXP)[0] - 1; // TODO: make this more robust
 
     /* --- required (optional) --- */
     SEXP reqSEXP = getListElement(elt, "required");
@@ -574,7 +581,7 @@ void RSchema_to_Schemata(SEXP RSchema, FieldSchemata *field_schemata) {
   field_schemata->n_field_schemae = n;
 }
 
-SEXP C_read_tsv_with_schema(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
+SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
 
   AS_NTHREAD
 
@@ -716,7 +723,7 @@ SEXP C_read_tsv_with_schema(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
   Free_FieldSchemata(fs);
   free(col_order);
   free_table(DT);
-  return R_NilValue;
+  return ScalarReal(n_rows);
 }
 
 
