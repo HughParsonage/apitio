@@ -555,6 +555,7 @@ void RSchema_to_Schemata(SEXP RSchema, FieldSchemata *field_schemata) {
       FS[i].na_strings = NULL;
     }
 
+    FieldSchema *fs = &FS[i];
     fs->n_na = 0;
     for (const char **pp = fs->na_strings; pp && *pp; ++pp) {
       fs->n_na++;
@@ -591,6 +592,8 @@ void RSchema_to_Schemata(SEXP RSchema, FieldSchemata *field_schemata) {
   field_schemata->FS = FS;
   field_schemata->n_field_schemae = n;
 }
+
+
 
 SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
 
@@ -725,6 +728,8 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
   int any_fatal = 0;
   int any_warn  = 0;
 
+  // Build up our unchanging parse context
+
   ParseCtx *ctx = calloc(fs->n_field_schemae, sizeof(ParseCtx));
   for (int fld = 0; fld < fs->n_field_schemae; ++fld) {
     int disk_col = col_order[fld];
@@ -748,41 +753,39 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
     const char *p = data + start;
 
     for (int fld = 0; fld < fs->n_field_schemae; ++fld) {
-      int disk_col = col_order[fld];
-      if (disk_col < 0) {
+      if (!ctx[fld].active) {
         continue;
       }
 
-      FieldSchema *s = &fs->FS[fld];
-      Column     *col = &DT->cols[disk_col];
+      FieldSchema *s    = ctx[fld].s;
+      void        *buf  = ctx[fld].data;
 
       // 1. Fast-path NA test:
+      bool matched_na = false;
       if (s->n_na) {
         if (s->na_single_char) {
-          // super-fast single-char NA?
           if (*p == s->na_char && (p[1]=='\t' || p[1]=='\n' || p[1]=='\0')) {
-            set_na_in_column(col, i);         // user-defined helper to flag NA
-            p += 1 + !!p[1];                   // skip '?' and optional delimiter
-            continue;                          // next field
+            set_na_in_column_ctx(&ctx[fld], i);
+            p += 1 + !!p[1];
+            continue;           // we know it’s NA, so skip the rest
           }
         } else {
-          // slower: multi-string list
           const char *start = p;
           while (*p && *p!='\t' && *p!='\n') ++p;
           size_t len = p - start;
           for (size_t k = 0; k < s->n_na; ++k) {
-            if (strlen(s->na_strings[k]) == len &&
-                strncmp(start, s->na_strings[k], len) == 0) {
-              set_na_in_column(col, i);
-              break;    // matched an NA string
+            if (strlen(s->na_strings[k]) == len
+                  && strncmp(start, s->na_strings[k], len) == 0) {
+              set_na_in_column_ctx(&ctx[fld], i);
+              matched_na = true;
+              break;
             }
           }
-          if (col_is_na(col, i)) {
+          if (matched_na) {
             if (*p) ++p;
-            continue;   // next field
+            continue;           // skip normal parsing
           }
-          if (*p) ++p;  // else fall through to normal parse of token
-          // rewind p if you need to re-parse the token below
+          // rewind for the normal parser
           p = start;
         }
       }
@@ -797,9 +800,10 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
             s->required ? &any_fatal : &any_warn,
             1
           );
+          ((int32_t*)buf)[i] = NA_INTEGER;
+        } else {
+          ((int32_t*)buf)[i] = v;
         }
-        ((int32_t*)col->data)[i] = v;
-
       }
         break;
         // other TYPE cases identical to before, but only OR the flags

@@ -241,6 +241,26 @@ static inline bool col_is_na(const Column *col, size_t i) {
   }
 }
 
+static inline void set_na_in_column_ctx(const ParseCtx *ctx, size_t i) {
+  switch (ctx->type) {
+  case TYPE_INT32:
+    ((int32_t*)ctx->data)[i] = NA_INTEGER;
+    break;
+  case TYPE_INT64:
+    ((int64_t*)ctx->data)[i] = (int64_t)NA_INTEGER;
+    break;
+  case TYPE_DOUBL:
+    ((double*)ctx->data)[i] = NA_REAL;
+    break;
+  case TYPE_STRIN:
+    ((char**)ctx->data)[i] = NULL;    // our sentinel for missing strings
+    break;
+  default:
+    // bit-fields etc have no NA
+    break;
+  }
+}
+
 
 // getListElement
 SEXP getListElement(SEXP list, const char *name);
