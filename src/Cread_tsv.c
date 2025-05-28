@@ -130,7 +130,7 @@ size_t count_rows_avx2_omp(const char *data, size_t len) {
   size_t end   = start + chunk_size;
   if (end > len) end = len;
 
-  // AVX2‐fast pass over aligned 32‐byte blocks
+  // AVX2 fast pass over aligned 32 byte blocks
   size_t i = start;
   // align i up to the next multiple of 32 if needed
   // size_t aligned_start = (i + 31) & ~31;
@@ -205,14 +205,14 @@ SEXP C_read_tsv_two_ints(SEXP filePathSEXP) {
 
   // offsets array
   uint64_t* row_off = malloc(n_rows * sizeof(uint64_t));
-  // --- begin production‐ready offset building ---
+  // --- begin production-ready offset building ---
 
   // 1. Compute blocks & tail
   size_t total_blocks    = len / 32;
   size_t remainder_start = total_blocks * 32;
   int    nThread         = omp_get_max_threads();
 
-  // 2. Per‐thread count of newlines in the aligned 32 B blocks
+  // 2. Per-thread count of newlines in the aligned 32 B blocks
   size_t *counts = malloc(nThread * sizeof *counts);
 
 #pragma omp parallel
@@ -225,17 +225,17 @@ SEXP C_read_tsv_two_ints(SEXP filePathSEXP) {
   for (size_t b = start_blk; b < end_blk; ++b) {
     // absolute file offset of this chunk:
     size_t off = data_start + b * 32;
-    // only count (NULL → no writes):
+    // only count (NULL -> no writes):
     local_cnt += find_newlines_avx2(
       (const uint8_t*)(data + off),
-      off,          // <-- CORRECT: use file offset, not “32”
+      off,          // <-- CORRECT: use file offset, not 32
       NULL
     );
   }
   counts[tid] = local_cnt;
 }
 
-// 3. Build prefix‐sum so each thread knows where to write into row_off[]
+// 3. Build prefix-sum so each thread knows where to write into row_off[]
 size_t *prefix = malloc(nThread * sizeof *prefix);
 size_t sum_off = 0;
 for (int t = 0; t < nThread; ++t) {
@@ -376,7 +376,7 @@ void Free_FieldSchemata(FieldSchemata *fs) {
     return;
   }
   for (int i = 0; i < fs->n_field_schemae; i++) {
-    /* free the strdup’d name */
+    /* free the strdup'd name */
     free((char*)fs->FS[i].name);
 
     if (fs->FS[i].na_strings) {
@@ -555,6 +555,17 @@ void RSchema_to_Schemata(SEXP RSchema, FieldSchemata *field_schemata) {
       FS[i].na_strings = NULL;
     }
 
+    fs->n_na = 0;
+    for (const char **pp = fs->na_strings; pp && *pp; ++pp) {
+      fs->n_na++;
+    }
+    if (fs->n_na == 1 && strlen(fs->na_strings[0]) == 1) {
+      fs->na_single_char = true;
+      fs->na_char       = fs->na_strings[0][0];
+    } else {
+      fs->na_single_char = false;
+    }
+
     /* --- valid (optional) --- */
     SEXP validSEXP = getListElement(elt, "valid");
     if (validSEXP != R_NilValue) {
@@ -646,7 +657,7 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
   //
   // You can now allocate your Table with fs->n_field_schemae columns
   // and, when parsing each row, use col_order[...] to pick the correct
-  // on‐disk field position.
+  // on-disk field position.
 
 
   // move to the main data.
@@ -694,27 +705,151 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
     }
   }
 
+  // uint64_t PARSE_STOP_FLAGS[128] = {0};
+  // uint64_t PARSE_WARN_FLAGS[128] = {0};
+
 
   Table *DT = allocate_table(n_cols, n_rows, Types);
 
-//   // parse rows
-//   int nThreadz = 10;
-//   for (size_t i = 0; i < 1; ++i) {
-//     size_t start = (i == 0 ? pos + 1 : row_off[i - 1]);
-//     const char* p = data + start;
-//     p = parse_nonneg_int32_fast(p, &c1[i]);
-//     p = parse_nonneg_int32_fast(p, &c2[i]);
-//   }
-//
-//
-// #pragma omp parallel for num_threads(nThreadz)
-//   for (size_t i = 1; i < n_rows; ++i) {
-//     size_t start = (i == 0 ? pos + 1 : row_off[i - 1]);
-//     const char* p = data + start;
-//     p = parse_nonneg_int32_fast(p, &c1[i]);
-//     p = parse_nonneg_int32_fast(p, &c2[i]);
-//   }
-//
+  //   // parse rows
+  //   int nThreadz = 10;
+  //   for (size_t i = 0; i < 1; ++i) {
+  //     size_t start = (i == 0 ? pos + 1 : row_off[i - 1]);
+  //     const char* p = data + start;
+  //     p = parse_nonneg_int32_fast(p, &c1[i]);
+  //     p = parse_nonneg_int32_fast(p, &c2[i]);
+  //   }
+  //
+  //
+  // 1. set up two plain ints (zero = no error yet)
+  int any_fatal = 0;
+  int any_warn  = 0;
+
+  ParseCtx *ctx = calloc(fs->n_field_schemae, sizeof(ParseCtx));
+  for (int fld = 0; fld < fs->n_field_schemae; ++fld) {
+    int disk_col = col_order[fld];
+    if (disk_col < 0) {
+      ctx[fld].active = false;
+      continue;
+    }
+    ctx[fld].active = true;
+    ctx[fld].s      = &fs->FS[fld];
+    ctx[fld].type   = fs->FS[fld].type;
+    ctx[fld].data   = DT->cols[disk_col].data;
+  }
+
+
+  // 2. hot-path, parallel parse loop only sets those flags
+#ifdef _OMP_APITF
+#pragma omp parallel for num_threads(nThread)
+#endif
+  for (size_t i = 0; i < n_rows; ++i) {
+    size_t start = (i == 0 ? data_start : row_offsets[i - 1]);
+    const char *p = data + start;
+
+    for (int fld = 0; fld < fs->n_field_schemae; ++fld) {
+      int disk_col = col_order[fld];
+      if (disk_col < 0) {
+        continue;
+      }
+
+      FieldSchema *s = &fs->FS[fld];
+      Column     *col = &DT->cols[disk_col];
+
+      // 1. Fast-path NA test:
+      if (s->n_na) {
+        if (s->na_single_char) {
+          // super-fast single-char NA?
+          if (*p == s->na_char && (p[1]=='\t' || p[1]=='\n' || p[1]=='\0')) {
+            set_na_in_column(col, i);         // user-defined helper to flag NA
+            p += 1 + !!p[1];                   // skip '?' and optional delimiter
+            continue;                          // next field
+          }
+        } else {
+          // slower: multi-string list
+          const char *start = p;
+          while (*p && *p!='\t' && *p!='\n') ++p;
+          size_t len = p - start;
+          for (size_t k = 0; k < s->n_na; ++k) {
+            if (strlen(s->na_strings[k]) == len &&
+                strncmp(start, s->na_strings[k], len) == 0) {
+              set_na_in_column(col, i);
+              break;    // matched an NA string
+            }
+          }
+          if (col_is_na(col, i)) {
+            if (*p) ++p;
+            continue;   // next field
+          }
+          if (*p) ++p;  // else fall through to normal parse of token
+          // rewind p if you need to re-parse the token below
+          p = start;
+        }
+      }
+
+      switch (s->type) {
+      case TYPE_INT32: {
+        int32_t v = 0;
+        p = do_parse_int32_fast(p, &v);
+        if (v < s->i_min || v > s->i_max) {
+          // atomic OR into one of our flags
+          __sync_fetch_and_or(
+            s->required ? &any_fatal : &any_warn,
+            1
+          );
+        }
+        ((int32_t*)col->data)[i] = v;
+
+      }
+        break;
+        // other TYPE cases identical to before, but only OR the flags
+      default:
+        do {
+        while (*p && *p != '\t' && *p != '\n') {
+          ++p;
+        }
+        if (*p) {
+          ++p;
+        }
+      } while (0);
+        break;
+      }
+    }
+  }
+
+  // 3. after parsing, if either flag is nonzero, do a serial re-scan to emit Rf_error/Rf_warning
+  if (any_fatal || any_warn) {
+    for (size_t i = 0; i < n_rows; ++i) {
+      size_t start = (i == 0 ? data_start : row_offsets[i-1]);
+      const char *p = data + start;
+      for (int fld = 0; fld < fs->n_field_schemae; ++fld) {
+        int disk_col = col_order[fld];
+        if (disk_col < 0) continue;
+        FieldSchema *s = &fs->FS[fld];
+        // parse just like above; on first failure call Rf_error/Rf_warning and break
+        if (s->type == TYPE_INT32) {
+          int32_t v;
+          p = do_parse_int32_fast(p, &v);
+          if (v < s->i_min || v > s->i_max) {
+            if (s->required) {
+              Rf_error("Row %zu, col '%s': %d not in [%d,%d]",
+                       i+1, s->name, v, s->i_min, s->i_max);
+            } else {
+              Rf_warning("Row %zu, col '%s': %d not in [%d,%d]",
+                         i+1, s->name, v, s->i_min, s->i_max);
+            }
+            break;
+          }
+        }
+        else {
+          // skip token
+          while (*p && *p!='\t' && *p!='\n') ++p;
+          if (*p) ++p;
+        }
+      }
+    }
+  }
+
 
 
   unmap_file(data, len);
@@ -723,6 +858,7 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
   Free_FieldSchemata(fs);
   free(col_order);
   free_table(DT);
+  free(ctx);
   return ScalarReal(n_rows);
 }
 

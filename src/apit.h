@@ -108,14 +108,27 @@ typedef enum {
 
 static const char CHAR_YNQ[3] = {'?', 'N', 'Y'};
 
+
+
+
 typedef struct {
   const char   *name;          // column name
   TypeCode      type;          // how to parse
   bool          required;      // must appear
   int32_t       i_min, i_max;  // for INT32 range checks
   const char ** na_strings;    // values which should be interpreted as NA
+  int           n_na;
+  bool          na_single_char;
+  char          na_char;
   const char ** valid;         // NULL-terminated set for string enums
 } FieldSchema;
+
+typedef struct {
+  FieldSchema *s;        // pointer to the schema for this field
+  void        *data;     // pointer to the start of the column's data buffer
+  TypeCode     type;     // cached type code
+  bool         active;   // false if disk_col < 0 -> skip
+} ParseCtx;
 
 typedef struct {
   TypeCode type;
@@ -200,6 +213,32 @@ static inline uint32_t find_newlines_avx2(const uint8_t *block,
     m &= m - 1;
   }
   return n;  // number of newlines found
+}
+
+static inline bool col_is_na(const Column *col, size_t i) {
+  switch (col->type) {
+  case TYPE_INT32: {
+    int32_t v = ((int32_t*)col->data)[i];
+    return v == NA_INTEGER;           // R’s integer NA :contentReference[oaicite:1]{index=1}
+  }
+  case TYPE_INT64: {
+    int64_t v = ((int64_t*)col->data)[i];
+    // no distinct int64 NA in R’s C API, so treat INT32 NA constant
+    return v == NA_INTEGER;
+  }
+  case TYPE_DOUBL: {
+    double d = ((double*)col->data)[i];
+    // catches both NA_REAL and NaNs
+    return ISNA(d) || isnan(d);
+  }
+  case TYPE_STRIN: {
+    // we represent missing strings as NULL pointers
+    return ((char**)col->data)[i] == NULL;
+  }
+  default:
+    // bit‐fields (1,2,16) and any other types are always “present”
+    return false;
+  }
 }
 
 

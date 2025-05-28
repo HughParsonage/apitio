@@ -7,7 +7,7 @@
 \usage{
 read_tsv_with_schemata(file.tsv, Schemata, nThread = 2L)
 
-test_rtsv()
+test_rtsv(nThread = 1L)
 }
 \arguments{
 \item{file.tsv}{A tsv file.}
