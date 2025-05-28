@@ -9,6 +9,8 @@
 #define _CRT_SECURE_NO_WARNINGS
 #define _POSIX_C_SOURCE 200809L
 
+#define MAX_COLUMNS 1024
+
 #include <R.h>
 #include <Rinternals.h>
 #include <R_ext/Altrep.h>
@@ -25,10 +27,20 @@
 #include <windows.h>
 #include <io.h>
 #else
-#include <sys/mman.h>
 #include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#if defined _OPENMP && _OPENMP >= 201511 && !defined
+#define _OMP_APITF
+#endif
+
 
 // Pull in all the x86 SIMD intrinsics
 #if defined(__GNUC__) || defined(__clang__)
@@ -83,6 +95,44 @@ enum {
   ST_DICT16 = 5
 };
 
+typedef enum {
+  TYPE_1_BIT;
+  TYPE_2_BIT;
+  TYPE_16BIT;
+  TYPE_INT00; // 100 * int
+  TYPE_INT32;
+  TYPE_INT64;
+  TYPE_DOUBL;
+} TypeCode;
+
+static const char CHAR_YNQ[3] = {'?', 'N', 'Y'};
+
+typedef struct {
+  const char   *name;          // column name
+  TypeCode      type;          // how to parse
+  bool          required;      // must appear
+  int32_t       i_min, i_max;  // for INT32 range checks
+  const char ** na_strings;    // values which should be interpreted as NA
+  const char ** valid;         // NULL-terminated set for string enums
+} FieldSchema;
+
+typedef struct {
+  TypeCode type;
+  void *data;     // Points to int32_t*, double*, or char** depending on type
+  size_t size;    // Number of rows
+} Column;
+
+typedef struct {
+  size_t ncols;
+  size_t nrows;
+  Column *cols;
+} Table;
+
+typedef struct {
+  FieldSchema *FS;
+  int n_field_schemae;
+} FieldSchemata;
+
 /* ---- page-align helper ---- */
 static inline uint64_t round_up_4k(uint64_t x) {
   return (x + 4095u) & ~4095u;
@@ -92,7 +142,7 @@ static inline bool is_digit(char c) {
   return (unsigned)(c - '0') < 10u;
 }
 
-static inline const char *do_parse_int32_fast(const char *p, int32_t *out) {
+static inline const char * do_parse_int32_fast(const char *p, int32_t *out) {
   int32_t v = 0;
   bool neg = (*p == '-');
   if (neg) ++p;
@@ -105,7 +155,7 @@ static inline const char *do_parse_int32_fast(const char *p, int32_t *out) {
   return (*p == ',' || *p == '\t' || *p == '\n') ? p + 1 : p;
 }
 
-static inline const char *parse_nonneg_int32_fast(const char *p, int32_t *out) {
+static inline const char * parse_nonneg_int32_fast(const char *p, int32_t *out) {
   int32_t v = 0;
 
   /* unrolled 16-digit loop handles 99.9 % of tax data */
@@ -114,6 +164,20 @@ static inline const char *parse_nonneg_int32_fast(const char *p, int32_t *out) {
   *out = v;
   /* caller expects pointer at next field start */
   return (*p == ',' || *p == '\t' || *p == '\n') ? p + 1 : p;
+}
+
+static inline const char * parse_ynq(const char *p, int *out) {
+  switch(*p) {
+  case 'Y':
+    *out = 1;
+    break;
+  case 'N':
+    *out = 0;
+    break;
+  default:
+    *out = -1;
+  }
+  return p + 1;
 }
 
 static inline void bitset_put(uint8_t *dst, uint64_t idx, bool val) {
@@ -136,6 +200,10 @@ static inline uint32_t find_newlines_avx2(const uint8_t *block,
   }
   return n;  // number of newlines found
 }
+
+
+// getListElement
+SEXP getListElement(SEXP list, const char *name);
 
 
 

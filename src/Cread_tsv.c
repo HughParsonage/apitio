@@ -33,16 +33,7 @@ void tictok(const char * msg, clock_t * t0) {
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
-#include <immintrin.h>
-#include <omp.h>
+
 
 // Memory-map file cross-platform
 static char* map_file(const char* path, size_t* length) {
@@ -164,6 +155,20 @@ static size_t count_rows_avx2_omp(const char *data, size_t len) {
 return total;
 }
 
+int n_columns(const char *data, size_t len, const char sep, int col_widths[MAX_COLUMNS]) {
+  int n_cols = 0;
+  for (int j = 0; j < len; ++j) {
+    if (data[j] == '\n') {
+      break;
+    }
+    if (data[j] == sep) {
+      ++n_cols;
+    }
+    col_widths[n_cols % MAX_COLUMNS]++;
+  }
+  return n_cols;
+}
+
 
 
 SEXP C_read_tsv_two_ints(SEXP filePathSEXP) {
@@ -260,7 +265,7 @@ for (int t = 0; t < nThread; ++t) {
   }
 }
 
-// 5. Handle the final “remainder” bytes serially
+// 5. Handle the final remainder bytes serially
 size_t n_off = sum_off;
 for (size_t i = remainder_start; i < data_len; ++i) {
   if (data[data_start + i] == '\n') {
@@ -334,6 +339,265 @@ free(prefix);
   return df;
 }
 
+static void free_colnames(char **colnames, int ncolumns) {
+  if (!colnames) {
+    return;
+  }
+  for (int j = 0; j < ncolumns; ++j) {
+    if (colnames[j]) {
+      free(colnames[j]);
+    }
+  }
+  free(colnames);
+}
+
+static void collect_colnames(char **colnames, const char *data, size_t len,
+                             int ncolumns, int col_widths[MAX_COLUMNS]) {
+  bool any_null = false;
+  for (int j = 0; j < ncolumns; ++j) {
+    colnames[j] = calloc(sizeof(char) * (col_widths[j] + 1));
+    any_null = any_null || !colnames[j];
+  }
+  if (any_null) {
+    free_colnames(colnames, ncolumns);
+    return;
+  }
+  int j = 0;
+  for (int k = 0, i = 0; data[k] != '\n'; ++k) {
+    if (data[k] == '\t') {
+      colnames[j][i++] = '\0';
+      i = 0;
+      ++j;
+      continue;
+    }
+    colnames[j][i++] = data[k];
+  }
+
+}
+
+void Free_FieldSchemata(FieldSchemata *fs) {
+  if (!fs || !fs->FS) {
+    return;
+  }
+  for (int i = 0; i < fs->n_field_schemae; i++) {
+    /* free the strdup’d name */
+    free((char*)fs->FS[i].name);
+
+    if (fs->FS[i].na_strings) {
+      for (char **p = (char**)fs->FS[i].na_strings; *p; ++p) {
+        free(*p);
+      }
+      free(fs->FS[i].na_strings);
+    }
+
+    /* free any enum strings and the array */
+    if (fs->FS[i].valid) {
+      for (char **p = (char**)fs->FS[i].valid; *p; ++p) {
+        free(*p);
+      }
+      free(fs->FS[i].valid);
+    }
+  }
+  /* free the FieldSchema array itself */
+  free(fs->FS);
+
+  /* reset to a safe empty state */
+  fs->FS = NULL;
+  fs->n_field_schemae = 0;
+}
+
+
+void RSchema_to_Schemata(SEXP RSchema, FieldSchemata *field_schemata) {
+  if (!isNewList(RSchema)) {
+    error("RSchema must be a list of per-column schema definitions");
+  }
+  R_xlen_t N_fields = xlength(RSchema);
+  if (N_fields <= 0) {
+    error("length(RSchema) must be > 0");
+  }
+  if (N_fields >= INT32_MAX) {
+    error("length(RSchema) is %lld, exceeds maximum supported fields",
+          (long long)N_fields);
+  }
+
+  int n = (int) N_fields;
+
+  /* Clean up any existing schema */
+  Free_FieldSchemata(field_schemata);
+
+  /* Allocate new array of FieldSchema */
+  FieldSchema *FS = calloc(n, sizeof(FieldSchema));
+  if (!FS) {
+    error("Memory allocation failed for %d FieldSchema entries", n);
+  }
+
+  for (int i = 0; i < n; i++) {
+    SEXP elt = VECTOR_ELT(RSchema, i);
+    if (!isNewList(elt)) {
+      error("Schema element %d must be a named list", i + 1);
+    }
+
+    /* --- name (required) --- */
+    SEXP nameSEXP = getListElement(elt, "name");
+    if (!isString(nameSEXP) || xlength(nameSEXP) != 1) {
+      error("Schema element %d: 'name' must be a single string", i + 1);
+    }
+    FS[i].name = strdup(CHAR(STRING_ELT(nameSEXP, 0)));
+
+    /* --- type (required) --- */
+    SEXP typeSEXP = getListElement(elt, "type");
+    if (!isInteger(typeSEXP) || xlength(typeSEXP) != 1) {
+      error("Schema for '%s': 'type' must be a single integer", FS[i].name);
+    }
+    FS[i].type = (TypeCode) INTEGER(typeSEXP)[0];
+
+    /* --- required (optional) --- */
+    SEXP reqSEXP = getListElement(elt, "required");
+    FS[i].required = (reqSEXP != R_NilValue && LOGICAL(reqSEXP)[0]);
+
+    /* --- i_min / i_max (optional) --- */
+    SEXP minSEXP = getListElement(elt, "i_min");
+    FS[i].i_min = (minSEXP != R_NilValue) ? INTEGER(minSEXP)[0] : INT32_MIN;
+    SEXP maxSEXP = getListElement(elt, "i_max");
+    FS[i].i_max = (maxSEXP != R_NilValue) ? INTEGER(maxSEXP)[0] : INT32_MAX;
+
+    /* --- na_strings (optional) --- */
+    SEXP naSEXP = getListElement(elt, "na_strings");
+    if (naSEXP != R_NilValue) {
+      if (!isString(naSEXP)) {
+        error("Schema for '%s': 'na_strings' must be a character vector", FS[i].name);
+      }
+      R_xlen_t nn = xlength(naSEXP);
+      const char **nas = malloc((nn + 1) * sizeof(const char *));
+      if (!nas) {
+        error("Memory allocation failed for na_strings of '%s'", FS[i].name);
+      }
+      for (R_xlen_t j = 0; j < nn; j++) {
+        nas[j] = strdup(CHAR(STRING_ELT(naSEXP, j)));
+      }
+      nas[nn] = NULL;
+      FS[i].na_strings = nas;
+    } else {
+      FS[i].na_strings = NULL;
+    }
+
+    /* --- valid (optional) --- */
+    SEXP validSEXP = getListElement(elt, "valid");
+    if (validSEXP != R_NilValue) {
+      if (!isString(validSEXP)) {
+        error("Schema for '%s': 'valid' must be a character vector", FS[i].name);
+      }
+      R_xlen_t nv = xlength(validSEXP);
+      const char **vals = malloc((nv + 1) * sizeof(const char *));
+      if (!vals) {
+        error("Memory allocation failed for valid[] of '%s'", FS[i].name);
+      }
+      for (R_xlen_t j = 0; j < nv; j++) {
+        vals[j] = strdup(CHAR(STRING_ELT(validSEXP, j)));
+      }
+      vals[nv] = NULL;
+      FS[i].valid = vals;
+    } else {
+      FS[i].valid = NULL;
+    }
+  }
+
+  /* Attach new schema array */
+  field_schemata->FS = FS;
+  field_schemata->n_field_schemae = n;
+}
+
+SEXP C_read_tsv_with_schema(SEXP FileTsv, SEXP RSchema) {
+  if (!isNewList(RSchema)) {
+    error("RSchema must be a list type.");
+  }
+  if (!isString(FileTsv) || !xlength(FileTsv)) {
+    error("FileTsv must be a STRSXP");
+  }
+  size_t len = 0;
+  char* data = map_file(path, &len);
+  if (!len) {
+    unmap_file(data, len);
+    return R_NilValue;
+  }
+  int col_widths[MAX_COLUMNS] = {0};
+  int n_cols = n_columns(data, len, '\t', col_widths);
+  if (n_cols >= MAX_COLUMNS) {
+    unmap_file(data, len);
+    error("n_cols = %d detected, beyond the maximum supported (%d).", n_cols, MAX_COLUMNS);
+  }
+  char **colnames = malloc(sizeof(char*) * n_cols);
+  if (!colnames) {
+    unmap_file(data, len);
+    error("(Internal) could not malloc char **colnames");
+  }
+  collect_colnames(colnames, data, len, n_cols, col_widths);
+
+  FieldSchemata *fs = calloc(1, sizeof(*fs));     // zeroes FS and n_field_schemae
+  RSchema_to_Schemata(RSchema, fs);
+
+  // determine col order
+
+  // move to the main data.
+  size_t pos = 0;
+  while (pos < len && data[pos] != '\n') {
+    ++pos;
+  }
+  size_t data_start = pos + 1;
+
+
+  // get row numbers
+#ifdef _OMP_APITF
+#pragma omp parallel for reduction(+:n_rows)
+#endif
+  for (size_t i = pos + 1; i < len; ++i) {
+    if (data[i] == '\n') {
+      n_rows++;
+    }
+  }
+
+  // get row positions
+  uint64_t row_offsets = malloc(sizeof(uint64_t) * n_rows);
+  if (!row_offsets) {
+    unmap_file(data, len);
+    free_colnames(colnames);
+    free(row_offsets);
+  }
+
+  size_t n_off = 0;
+  size_t full32 = (len / 32) * 32;
+  for (size_t i = 0; i < full32; i += 32) {
+    n_off += find_newlines_avx2((const uint8_t *)(data + data_start + i),
+                                data_start + i,
+                                row_off + n_off);
+  }
+
+//   // parse rows
+//   int nThreadz = 10;
+//   for (size_t i = 0; i < 1; ++i) {
+//     size_t start = (i == 0 ? pos + 1 : row_off[i - 1]);
+//     const char* p = data + start;
+//     p = parse_nonneg_int32_fast(p, &c1[i]);
+//     p = parse_nonneg_int32_fast(p, &c2[i]);
+//   }
+//
+//
+// #pragma omp parallel for num_threads(nThreadz)
+//   for (size_t i = 1; i < n_rows; ++i) {
+//     size_t start = (i == 0 ? pos + 1 : row_off[i - 1]);
+//     const char* p = data + start;
+//     p = parse_nonneg_int32_fast(p, &c1[i]);
+//     p = parse_nonneg_int32_fast(p, &c2[i]);
+//   }
+//
+
+
+  unmap_file(data, len);
+  free_colnames(colnames);
+  free(row_offsets);
+  Free_FieldSchemata(fs)
+  return R_NilValue;
+}
 
 
 
