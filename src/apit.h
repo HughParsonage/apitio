@@ -37,7 +37,7 @@
 #include <omp.h>
 #endif
 
-#if defined _OPENMP && _OPENMP >= 201511 && !defined
+#if defined _OPENMP && _OPENMP >= 201511 && !defined _OMP_APITF
 #define _OMP_APITF
 #endif
 
@@ -96,13 +96,14 @@ enum {
 };
 
 typedef enum {
-  TYPE_1_BIT;
-  TYPE_2_BIT;
-  TYPE_16BIT;
-  TYPE_INT00; // 100 * int
-  TYPE_INT32;
-  TYPE_INT64;
-  TYPE_DOUBL;
+  TYPE_1_BIT,
+  TYPE_2_BIT,
+  TYPE_16BIT,
+  TYPE_INT00, // 100 * int
+  TYPE_INT32,
+  TYPE_INT64,
+  TYPE_DOUBL,
+  TYPE_STRIN,
 } TypeCode;
 
 static const char CHAR_YNQ[3] = {'?', 'N', 'Y'};
@@ -206,6 +207,15 @@ static inline uint32_t find_newlines_avx2(const uint8_t *block,
 SEXP getListElement(SEXP list, const char *name);
 
 
+// omp_diagnose.c
+// Use AS_NTHREAD macro to avoid unused nThread warning on machines without omp.h
+int as_nThread(SEXP x);
+#if _OPENMP
+#define AS_NTHREAD int nThread = check_nthreads(nthreads);
+#else
+#define AS_NTHREAD do {;} while (0);
+#endif
+int check_nthreads(SEXP nthreads);
 
 
 

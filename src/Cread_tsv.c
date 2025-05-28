@@ -1,5 +1,15 @@
 #include "apit.h"
 
+/*
+ * High-performance TSV parser for salary, age, gender using SIMD (AVX2) + OpenMP
+ * salary: integer <= 1e9-1
+ * age: integer <= 127
+ * gender: 'M' or 'F'
+ * Columns in any order but exactly these three.
+ * Entry point: SEXP read_tsv_special(SEXP filePathSEXP)
+ * Windows and POSIX compatible.
+ */
+
 SEXP Cread_tsv(SEXP file_tsv,
                SEXP nthreads) {
   if (!isString(file_tsv) || !isInteger(nthreads)) {
@@ -18,21 +28,7 @@ void tictok(const char * msg, clock_t * t0) {
 }
 
 
-/*
- * High-performance TSV parser for salary, age, gender using SIMD (AVX2) + OpenMP
- * salary: integer <= 1e9-1
- * age: integer <= 127
- * gender: 'M' or 'F'
- * Columns in any order but exactly these three.
- * Entry point: SEXP read_tsv_special(SEXP filePathSEXP)
- * Windows and POSIX compatible.
- */
 
-#include <R.h>
-#include <Rinternals.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
 
 
 // Memory-map file cross-platform
@@ -93,7 +89,7 @@ static void unmap_file(char* data, size_t length) {
 #include <stdint.h>
 
 // Count newlines using AVX2 + popcount
-static size_t count_rows_avx2(const char *data, size_t len) {
+size_t count_rows_avx2(const char *data, size_t len) {
   size_t i = 0, count = 0;
 
   // Prepare a vector full of '\n'
@@ -118,7 +114,7 @@ static size_t count_rows_avx2(const char *data, size_t len) {
   return count;
 }
 
-static size_t count_rows_avx2_omp(const char *data, size_t len) {
+size_t count_rows_avx2_omp(const char *data, size_t len) {
   size_t total = 0;
   const __m256i vnl = _mm256_set1_epi8('\n');
 
@@ -355,7 +351,7 @@ static void collect_colnames(char **colnames, const char *data, size_t len,
                              int ncolumns, int col_widths[MAX_COLUMNS]) {
   bool any_null = false;
   for (int j = 0; j < ncolumns; ++j) {
-    colnames[j] = calloc(sizeof(char) * (col_widths[j] + 1));
+    colnames[j] = calloc((col_widths[j] + 1), sizeof(char));
     any_null = any_null || !colnames[j];
   }
   if (any_null) {
@@ -404,6 +400,77 @@ void Free_FieldSchemata(FieldSchemata *fs) {
   /* reset to a safe empty state */
   fs->FS = NULL;
   fs->n_field_schemae = 0;
+}
+
+void free_table(Table *t) {
+  if (!t) return;
+  for (size_t i = 0; i < t->ncols; ++i) {
+    if (t->cols[i].type == TYPE_STRIN) {
+      char **strings = t->cols[i].data;
+      for (size_t j = 0; j < t->cols[i].size; ++j) {
+        free(strings[j]);  // assuming strdup or malloc used
+      }
+    }
+    free(t->cols[i].data);
+  }
+  free(t->cols);
+  free(t);
+}
+
+
+Table *allocate_table(size_t ncols, size_t nrows, const TypeCode *types) {
+  Table *t = malloc(sizeof(Table));
+  if (!t) return NULL;
+
+  t->ncols = ncols;
+  t->nrows = nrows;
+  t->cols = calloc(ncols, sizeof(Column));
+  if (!t->cols) {
+    free(t);
+    return NULL;
+  }
+
+  for (size_t i = 0; i < ncols; ++i) {
+    t->cols[i].type = types[i];
+    t->cols[i].size = nrows;
+    switch (types[i]) {
+    case TYPE_1_BIT:
+      t->cols[i].data = calloc(nrows, sizeof(char));
+      break;
+    case TYPE_2_BIT:
+      t->cols[i].data = calloc(nrows, sizeof(char));
+      break;
+    case TYPE_16BIT:
+      t->cols[i].data = calloc(nrows, sizeof(char));
+      break;
+    case TYPE_INT32:
+      t->cols[i].data = calloc(nrows, sizeof(int32_t));
+      break;
+    case TYPE_INT00:
+      t->cols[i].data = calloc(nrows, sizeof(int32_t));
+      break;
+    case TYPE_INT64:
+      t->cols[i].data = calloc(nrows, sizeof(int64_t));
+      break;
+    case TYPE_DOUBL:
+      t->cols[i].data = calloc(nrows, sizeof(double));
+      break;
+    case TYPE_STRIN:
+      t->cols[i].data = calloc(nrows, sizeof(char*));  // pointers to strings
+      break;
+    }
+    if (!t->cols[i].data) {
+      // free previous allocations
+      for (size_t j = 0; j < i; ++j) {
+        free(t->cols[j].data);
+      }
+      free(t->cols);
+      free(t);
+      return NULL;
+    }
+  }
+
+  return t;
 }
 
 
@@ -507,13 +574,18 @@ void RSchema_to_Schemata(SEXP RSchema, FieldSchemata *field_schemata) {
   field_schemata->n_field_schemae = n;
 }
 
-SEXP C_read_tsv_with_schema(SEXP FileTsv, SEXP RSchema) {
+SEXP C_read_tsv_with_schema(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
+
+  AS_NTHREAD
+
   if (!isNewList(RSchema)) {
     error("RSchema must be a list type.");
   }
   if (!isString(FileTsv) || !xlength(FileTsv)) {
     error("FileTsv must be a STRSXP");
   }
+  const char *path = CHAR(STRING_ELT(FileTsv, 0));
+
   size_t len = 0;
   char* data = map_file(path, &len);
   if (!len) {
@@ -536,7 +608,39 @@ SEXP C_read_tsv_with_schema(SEXP FileTsv, SEXP RSchema) {
   FieldSchemata *fs = calloc(1, sizeof(*fs));     // zeroes FS and n_field_schemae
   RSchema_to_Schemata(RSchema, fs);
 
-  // determine col order
+  // determine col order: map schema fields to on-disk column indices
+  int n_schema = fs->n_field_schemae;
+  int *col_order = calloc(n_schema, sizeof(*col_order));
+  if (!col_order) {
+    Free_FieldSchemata(fs);
+    unmap_file(data, len);
+    error("Memory allocation failed for column order mapping");
+  }
+
+  for (int i = 0; i < n_schema; i++) {
+    col_order[i] = -1;
+    for (int j = 0; j < n_cols; j++) {
+      if (strcmp(fs->FS[i].name, colnames[j]) == 0) {
+        col_order[i] = j;
+        break;
+      }
+    }
+    if (col_order[i] < 0 && fs->FS[i].required) {
+      free(col_order);
+      Free_FieldSchemata(fs);
+      unmap_file(data, len);
+      error("Required column '%s' not found in header", fs->FS[i].name);
+    }
+  }
+
+  // At this point:
+  //   - col_order[i] >= 0 for every schema field that exists on disk
+  //   - any optional schema fields missing on disk have col_order[i] == -1
+  //
+  // You can now allocate your Table with fs->n_field_schemae columns
+  // and, when parsing each row, use col_order[...] to pick the correct
+  // on‐disk field position.
+
 
   // move to the main data.
   size_t pos = 0;
@@ -547,8 +651,9 @@ SEXP C_read_tsv_with_schema(SEXP FileTsv, SEXP RSchema) {
 
 
   // get row numbers
+  size_t n_rows = 0;
 #ifdef _OMP_APITF
-#pragma omp parallel for reduction(+:n_rows)
+#pragma omp parallel for num_threads(nThread) reduction(+:n_rows)
 #endif
   for (size_t i = pos + 1; i < len; ++i) {
     if (data[i] == '\n') {
@@ -557,11 +662,13 @@ SEXP C_read_tsv_with_schema(SEXP FileTsv, SEXP RSchema) {
   }
 
   // get row positions
-  uint64_t row_offsets = malloc(sizeof(uint64_t) * n_rows);
+  uint64_t *row_offsets = malloc(sizeof(uint64_t) * n_rows);
   if (!row_offsets) {
     unmap_file(data, len);
-    free_colnames(colnames);
+    free_colnames(colnames, n_cols);
     free(row_offsets);
+    free(col_order);
+    error("unable to malloc row_offsets");
   }
 
   size_t n_off = 0;
@@ -569,8 +676,19 @@ SEXP C_read_tsv_with_schema(SEXP FileTsv, SEXP RSchema) {
   for (size_t i = 0; i < full32; i += 32) {
     n_off += find_newlines_avx2((const uint8_t *)(data + data_start + i),
                                 data_start + i,
-                                row_off + n_off);
+                                row_offsets + n_off);
   }
+
+  TypeCode Types[MAX_COLUMNS] = {0};
+  for (int i = 0; i < fs->n_field_schemae; i++) {
+    int col = col_order[i];
+    if (col >= 0 && col < MAX_COLUMNS) {
+      Types[col] = fs->FS[i].type;
+    }
+  }
+
+
+  Table *DT = allocate_table(n_cols, n_rows, Types);
 
 //   // parse rows
 //   int nThreadz = 10;
@@ -593,9 +711,11 @@ SEXP C_read_tsv_with_schema(SEXP FileTsv, SEXP RSchema) {
 
 
   unmap_file(data, len);
-  free_colnames(colnames);
+  free_colnames(colnames, n_cols);
   free(row_offsets);
-  Free_FieldSchemata(fs)
+  Free_FieldSchemata(fs);
+  free(col_order);
+  free_table(DT);
   return R_NilValue;
 }
 
