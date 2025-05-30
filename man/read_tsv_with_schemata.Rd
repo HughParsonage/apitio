@@ -3,11 +3,14 @@
 \name{read_tsv_with_schemata}
 \alias{read_tsv_with_schemata}
 \alias{test_rtsv}
+\alias{test_rtsv_ynq}
 \title{Read a TSV with schemata}
 \usage{
 read_tsv_with_schemata(file.tsv, Schemata, nThread = 2L)
 
 test_rtsv(nThread = 1L)
+
+test_rtsv_ynq(nThread = 1L)
 }
 \arguments{
 \item{file.tsv}{A tsv file.}

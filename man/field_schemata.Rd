@@ -3,6 +3,7 @@
 \name{field_schemata}
 \alias{field_schemata}
 \alias{field_schema}
+\alias{field_ynq}
 \title{Create a field schemata list}
 \usage{
 field_schemata(..., FILE.YAML = NULL)
@@ -13,8 +14,11 @@ field_schema(
   i_min = NULL,
   i_max = NULL,
   na_strings = c("NA", "?"),
-  valid = NULL
+  valid = NULL,
+  preset = c("qny")
 )
+
+field_ynq(required = TRUE)
 }
 \arguments{
 \item{...}{A named list of calls to `field_schema`.}
@@ -29,7 +33,9 @@ field_schema(
 
 \item{na_strings}{A vector of strings that should be set to the missing value.}
 
-\item{valid}{A vector of strings that are valid for this field.}
+\item{valid}{A vector of strings that are (together with `na_strings`) valid for this field.}
+
+\item{preset}{A preset code, denoting a specific pre-defined schema.}
 }
 \value{
 A list, indicating the schema for each column.

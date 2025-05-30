@@ -2,8 +2,10 @@
 
 export(field_schema)
 export(field_schemata)
+export(field_ynq)
 export(read_apitf)
 export(read_tsv_with_schemata)
 export(test_rtsv)
+export(test_rtsv_ynq)
 export(write_apitf)
 useDynLib(apitio, .registration=TRUE)

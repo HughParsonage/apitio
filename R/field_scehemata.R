@@ -13,18 +13,31 @@ field_schemata <- function(..., FILE.YAML = NULL) {
 #' @param required (bool) whether the name is required (i.e. whether its absence should raise an error).
 #' @param i_min,i_max If the type is an integer type, the range of allowable integers.
 #' @param na_strings A vector of strings that should be set to the missing value.
-#' @param valid A vector of strings that are valid for this field.
+#' @param valid A vector of strings that are (together with `na_strings`) valid for this field.
+#' @param preset A preset code, denoting a specific pre-defined schema.
 #' @export
 field_schema <- function(type = c("bit1", "bit2", "bit16", "int100", "int32", "int64", "double", "string"),
                          required = FALSE,
                          i_min = NULL,
                          i_max = NULL,
                          na_strings = c("NA", "?"),
-                         valid = NULL) {
+                         valid = NULL,
+                         preset = c("qny")) {
   the_types <- c("bit1", "bit2", "bit16", "int100", "int32", "int64", "double", "string")
   list(type = match(type, the_types, nomatch = 0L),
        required = required,
        i_min = i_min,
        i_max = i_max,
-       valid = valid)
+       valid = valid,
+       preset = preset)
+}
+
+#' @rdname field_schemata
+#' @export
+field_ynq <- function(required = TRUE) {
+  field_schema(type = "bit2",
+               required = required,
+               na_strings = "?",
+               valid = c("N", "Y"),
+               preset = "ynq")
 }

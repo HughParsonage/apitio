@@ -106,6 +106,13 @@ typedef enum {
   TYPE_STRIN,
 } TypeCode;
 
+typedef enum {
+  SCHEMA_ANY,
+  SCHEMA_YNQ,
+  SCHEMA_YN,
+  SCHEMA_MF
+} SchemaPreset;
+
 static const char CHAR_YNQ[3] = {'?', 'N', 'Y'};
 
 
@@ -121,6 +128,7 @@ typedef struct {
   bool          na_single_char;
   char          na_char;
   const char ** valid;         // NULL-terminated set for string enums
+  SchemaPreset  preset;
 } FieldSchema;
 
 typedef struct {
@@ -219,11 +227,11 @@ static inline bool col_is_na(const Column *col, size_t i) {
   switch (col->type) {
   case TYPE_INT32: {
     int32_t v = ((int32_t*)col->data)[i];
-    return v == NA_INTEGER;           // R’s integer NA :contentReference[oaicite:1]{index=1}
+    return v == NA_INTEGER;
   }
   case TYPE_INT64: {
     int64_t v = ((int64_t*)col->data)[i];
-    // no distinct int64 NA in R’s C API, so treat INT32 NA constant
+    // should reconsider
     return v == NA_INTEGER;
   }
   case TYPE_DOUBL: {
@@ -236,7 +244,7 @@ static inline bool col_is_na(const Column *col, size_t i) {
     return ((char**)col->data)[i] == NULL;
   }
   default:
-    // bit‐fields (1,2,16) and any other types are always “present”
+    // bit‐fields (1,2,16) and any other types are always present
     return false;
   }
 }

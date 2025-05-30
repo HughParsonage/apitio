@@ -27,6 +27,27 @@ void tictok(const char * msg, clock_t * t0) {
   t0[0] = t;
 }
 
+static inline void bit2_put(uint8_t *dst, uint64_t idx, uint8_t v)
+  /* v in 0…3 */
+{
+  uint64_t byte = idx >> 2;          // 4 values / byte
+  unsigned shift = (idx & 3) * 2;    // 0,2,4,6
+  dst[byte]  &= ~(3u << shift);      // clear
+  dst[byte]  |=  (v & 3u) << shift;  // set
+}
+
+
+static uint8_t map_ynq[256];
+
+__attribute__((constructor)) static void init_map_ynq(void) {
+  for (int i = 0; i < 256; ++i) {
+    map_ynq[i] = 255;   // invalid
+  }
+  map_ynq['N'] = map_ynq['n'] = 0;
+  map_ynq['Y'] = map_ynq['y'] = 1;
+  map_ynq['?'] = 2;
+}
+
 
 
 
@@ -77,7 +98,9 @@ static char* map_file(const char* path, size_t* length) {
 #endif
 }
 static void unmap_file(char* data, size_t length) {
+
 #ifdef _WIN32
+  (void)length;
   UnmapViewOfFile(data);
 #else
   munmap(data, length);
@@ -153,7 +176,7 @@ return total;
 
 int n_columns(const char *data, size_t len, const char sep, int col_widths[MAX_COLUMNS]) {
   int n_cols = 1;
-  for (int j = 0; j < len; ++j) {
+  for (size_t j = 0; j < len; ++j) {
     if (data[j] == '\n') {
       break;
     }
@@ -359,7 +382,10 @@ static void collect_colnames(char **colnames, const char *data, size_t len,
     return;
   }
   int j = 0;
-  for (int k = 0, i = 0; data[k] != '\n'; ++k) {
+  for (size_t k = 0, i = 0; (data[k] != '\n' && data[k] != '\r'); ++k) {
+    if (k >= len) {
+      break; // # nocov
+    }
     if (data[k] == '\t') {
       colnames[j][i++] = '\0';
       i = 0;
@@ -377,7 +403,9 @@ void Free_FieldSchemata(FieldSchemata *fs) {
   }
   for (int i = 0; i < fs->n_field_schemae; i++) {
     /* free the strdup'd name */
-    free((char*)fs->FS[i].name);
+    if (fs->FS[i].name) {
+      free((char*)fs->FS[i].name);
+    }
 
     if (fs->FS[i].na_strings) {
       for (char **p = (char**)fs->FS[i].na_strings; *p; ++p) {
@@ -435,13 +463,13 @@ Table *allocate_table(size_t ncols, size_t nrows, const TypeCode *types) {
     t->cols[i].size = nrows;
     switch (types[i]) {
     case TYPE_1_BIT:
-      t->cols[i].data = calloc(nrows, sizeof(char));
+      t->cols[i].data = calloc((nrows + 7) / 8, sizeof(uint8_t));
       break;
     case TYPE_2_BIT:
-      t->cols[i].data = calloc(nrows, sizeof(char));
+      t->cols[i].data = calloc((nrows + 3) / 4, sizeof(uint8_t));
       break;
     case TYPE_16BIT:
-      t->cols[i].data = calloc(nrows, sizeof(char));
+      t->cols[i].data = calloc(nrows, sizeof(uint16_t));
       break;
     case TYPE_INT32:
       t->cols[i].data = calloc(nrows, sizeof(int32_t));
@@ -504,6 +532,7 @@ void RSchema_to_Schemata(SEXP RSchema, FieldSchemata *field_schemata) {
   for (int i = 0; i < n; i++) {
     SEXP elt = VECTOR_ELT(RSchema, i);
     if (!isNewList(elt)) {
+      Free_FieldSchemata(field_schemata);
       error("Schema element %d must be a named list", i + 1);
     }
 
@@ -513,6 +542,7 @@ void RSchema_to_Schemata(SEXP RSchema, FieldSchemata *field_schemata) {
     } else {
       SEXP nameSEXP = getListElement(elt, "name");
       if (!isString(nameSEXP) || xlength(nameSEXP) != 1) {
+        Free_FieldSchemata(field_schemata);
         error("Schema element %d: 'name' must be a single string", i + 1);
       }
       FS[i].name = strdup(CHAR(STRING_ELT(nameSEXP, 0)));
@@ -521,7 +551,12 @@ void RSchema_to_Schemata(SEXP RSchema, FieldSchemata *field_schemata) {
     /* --- type (required) --- */
     SEXP typeSEXP = getListElement(elt, "type");
     if (!isInteger(typeSEXP) || xlength(typeSEXP) != 1) {
-      error("Schema for '%s': 'type' must be a single integer", FS[i].name);
+      const char *src = FS[i].name;
+      size_t n = strlen(src);
+      char *colname = (char *)R_alloc(n + 1, sizeof(char));
+      memcpy(colname, src, n + 1);
+      Free_FieldSchemata(field_schemata);
+      error("Schema for '%s': 'type' must be a single integer", (const char *)colname);
     }
     FS[i].type = (TypeCode) INTEGER(typeSEXP)[0] - 1; // TODO: make this more robust
 
@@ -539,12 +574,23 @@ void RSchema_to_Schemata(SEXP RSchema, FieldSchemata *field_schemata) {
     SEXP naSEXP = getListElement(elt, "na_strings");
     if (naSEXP != R_NilValue) {
       if (!isString(naSEXP)) {
-        error("Schema for '%s': 'na_strings' must be a character vector", FS[i].name);
+        const char *src = FS[i].name;
+        size_t n = strlen(src);
+        char *colname = (char *)R_alloc(n + 1, sizeof(char));
+        memcpy(colname, src, n + 1);
+        Free_FieldSchemata(field_schemata);
+        Free_FieldSchemata(field_schemata);
+        error("Schema for '%s': 'na_strings' must be a character vector", (const char *)colname);
       }
       R_xlen_t nn = xlength(naSEXP);
       const char **nas = malloc((nn + 1) * sizeof(const char *));
       if (!nas) {
-        error("Memory allocation failed for na_strings of '%s'", FS[i].name);
+        const char *src = FS[i].name;
+        size_t n = strlen(src);
+        char *colname = (char *)R_alloc(n + 1, sizeof(char));
+        memcpy(colname, src, n + 1);
+        Free_FieldSchemata(field_schemata);
+        error("Memory allocation failed for na_strings of '%s'", (const char *)colname);
       }
       for (R_xlen_t j = 0; j < nn; j++) {
         nas[j] = strdup(CHAR(STRING_ELT(naSEXP, j)));
@@ -571,12 +617,22 @@ void RSchema_to_Schemata(SEXP RSchema, FieldSchemata *field_schemata) {
     SEXP validSEXP = getListElement(elt, "valid");
     if (validSEXP != R_NilValue) {
       if (!isString(validSEXP)) {
-        error("Schema for '%s': 'valid' must be a character vector", FS[i].name);
+        const char *src = FS[i].name;
+        size_t n = strlen(src);
+        char *colname = (char *)R_alloc(n + 1, sizeof(char));
+        memcpy(colname, src, n + 1);
+        Free_FieldSchemata(field_schemata);
+        error("Schema for '%s': 'valid' must be a character vector", (const char *)colname);
       }
       R_xlen_t nv = xlength(validSEXP);
       const char **vals = malloc((nv + 1) * sizeof(const char *));
       if (!vals) {
-        error("Memory allocation failed for valid[] of '%s'", FS[i].name);
+        const char *src = FS[i].name;
+        size_t n = strlen(src);
+        char *colname = (char *)R_alloc(n + 1, sizeof(char));
+        memcpy(colname, src, n + 1);
+        Free_FieldSchemata(field_schemata);
+        error("Memory allocation failed for valid[] of '%s'", (const char *)colname);
       }
       for (R_xlen_t j = 0; j < nv; j++) {
         vals[j] = strdup(CHAR(STRING_ELT(validSEXP, j)));
@@ -586,13 +642,29 @@ void RSchema_to_Schemata(SEXP RSchema, FieldSchemata *field_schemata) {
     } else {
       FS[i].valid = NULL;
     }
+
+    SEXP presetSEXP = getListElement(elt, "preset");
+    if (presetSEXP != R_NilValue) {
+      if (!isString(presetSEXP)) {
+        const char *src = FS[i].name;
+        size_t n = strlen(src);
+        char *colname = (char *)R_alloc(n + 1, sizeof(char));
+        memcpy(colname, src, n + 1);
+        Free_FieldSchemata(field_schemata);
+        error("Schema for '%s': 'preset' must be a character vector", (const char *)colname);
+      }
+      if (!strcmp(CHAR(STRING_ELT(presetSEXP, 0)), "ynq")) {
+        FS[i].preset = SCHEMA_YNQ;
+      } else {
+        FS[i].preset = SCHEMA_ANY;
+      }
+    }
   }
 
   /* Attach new schema array */
   field_schemata->FS = FS;
   field_schemata->n_field_schemae = n;
 }
-
 
 
 SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
@@ -640,6 +712,7 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
 
   for (int i = 0; i < n_schema; i++) {
     col_order[i] = -1;
+
     for (int j = 0; j < n_cols; j++) {
       if (strcmp(fs->FS[i].name, colnames[j]) == 0) {
         col_order[i] = j;
@@ -648,9 +721,15 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
     }
     if (col_order[i] < 0 && fs->FS[i].required) {
       free(col_order);
-      Free_FieldSchemata(fs);
       unmap_file(data, len);
-      error("Required column '%s' not found in header", fs->FS[i].name);
+
+      const char *src = fs->FS[i].name;
+      size_t n = strlen(src);
+      char *colname__i = (char *)R_alloc(n + 1, sizeof(char));
+      memcpy(colname__i, src, n + 1);
+
+      Free_FieldSchemata(fs);
+      error("Required column '%s' not found in header", (const char *)colname__i);
     }
   }
 
@@ -689,6 +768,7 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
     free_colnames(colnames, n_cols);
     free(row_offsets);
     free(col_order);
+    Free_FieldSchemata(fs);
     error("unable to malloc row_offsets");
   }
 
@@ -743,6 +823,7 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
     ctx[fld].data   = DT->cols[disk_col].data;
   }
 
+  const int n_fields = fs->n_field_schemae;
 
   // 2. hot-path, parallel parse loop only sets those flags
 #ifdef _OMP_APITF
@@ -752,13 +833,42 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
     size_t start = (i == 0 ? data_start : row_offsets[i - 1]);
     const char *p = data + start;
 
-    for (int fld = 0; fld < fs->n_field_schemae; ++fld) {
+    for (int fld = 0; fld < n_fields; ++fld) {
       if (!ctx[fld].active) {
         continue;
       }
 
       FieldSchema *s    = ctx[fld].s;
       void        *buf  = ctx[fld].data;
+      if (s->preset != SCHEMA_ANY) {
+        switch(s->preset) {
+        case SCHEMA_ANY:
+          break;
+        case SCHEMA_YNQ: {
+          // single-byte token, so *p is the value, *(p+1) is TAB or NL
+          unsigned int c = (unsigned char)*p;
+          uint8_t v = map_ynq[c];
+          if (v < 3) {                        // fast path, schema honoured
+            if (v == 2) {                   // NA
+              set_na_in_column_ctx(&ctx[fld], i);
+            } else {
+              bit2_put(ctx[fld].data, i, v);
+            }
+          } else {                            // invalid, flag & set NA
+            __sync_fetch_and_or(
+              s->required ? &any_fatal : &any_warn, 1);
+            set_na_in_column_ctx(&ctx[fld], i);
+          }
+          p += 1;                 // finished value byte
+          if (*p) ++p;            // skip TAB / NL
+          continue;               // go to next field
+        }
+        case SCHEMA_YN: {
+
+        }
+
+        }
+      }
 
       // 1. Fast-path NA test:
       bool matched_na = false;
@@ -772,10 +882,11 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
         } else {
           const char *start = p;
           while (*p && *p!='\t' && *p!='\n') ++p;
-          size_t len = p - start;
-          for (size_t k = 0; k < s->n_na; ++k) {
-            if (strlen(s->na_strings[k]) == len
-                  && strncmp(start, s->na_strings[k], len) == 0) {
+          const size_t len = p - start;
+          const size_t s_n_na = s->n_na;
+          for (size_t k = 0; k < s_n_na; ++k) {
+            if (strlen(s->na_strings[k]) == len &&
+                strncmp(start, s->na_strings[k], len) == 0) {
               set_na_in_column_ctx(&ctx[fld], i);
               matched_na = true;
               break;
@@ -809,7 +920,7 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
         // other TYPE cases identical to before, but only OR the flags
       default:
         do {
-        while (*p && *p != '\t' && *p != '\n') {
+        while (*p && *p != '\t' && *p != '\n' && *p != '\r') {
           ++p;
         }
         if (*p) {
@@ -836,7 +947,7 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
           p = do_parse_int32_fast(p, &v);
           if (v < s->i_min || v > s->i_max) {
             if (s->required) {
-              Rf_error("Row %zu, col '%s': %d not in [%d,%d]",
+              Rprintf("Row %zu, col '%s': %d not in [%d,%d]",
                        i+1, s->name, v, s->i_min, s->i_max);
             } else {
               Rf_warning("Row %zu, col '%s': %d not in [%d,%d]",
