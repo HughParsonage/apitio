@@ -2,3 +2,5 @@
 ^\.Rproj\.user$
 ^data-raw$
 ^.github$
+^do_test\.R$
+^setup\.R$

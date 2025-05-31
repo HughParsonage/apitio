@@ -281,6 +281,10 @@ int as_nThread(SEXP x);
 #define AS_NTHREAD int nThread = check_nthreads(nthreads);
 #else
 #define AS_NTHREAD do {;} while (0);
+
+int omp_get_max_threads(void);
+int omp_get_num_threads(void);
+int omp_get_thread_num(void);
 #endif
 int check_nthreads(SEXP nthreads);
 
