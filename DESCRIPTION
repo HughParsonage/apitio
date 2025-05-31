@@ -1,12 +1,12 @@
 Package: apitio
 Title: Australian Personal Income Tax File Input Output
-Version: 0.0.1
+Version: 0.0.2
 Authors@R: 
     person(given = "Hugh",
            family = "Parsonage",
            role = c("aut", "cre"),
            email = "hugh.parsonage@gmail.com")
-Description: Create files suitable for high-performance for the Australian personal income tax system
+Description: Create files suitable for high-performance for the Australian personal income tax system. Introduces the idea of a file schemata to assist with faster parsing and richer column classes.
 Depends: R (>= 4.2.0)
 License: GPL-2
 Encoding: UTF-8

@@ -866,6 +866,9 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
         case SCHEMA_YN: {
 
         }
+        case SCHEMA_MF: {
+
+        }
 
         }
       }

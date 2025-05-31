@@ -66,6 +66,18 @@ int diagnose_omp(SEXP Threads_requested) {
 int as_nThread(SEXP x) {
   return 1;
 }
+
+int omp_get_max_threads(void) {
+  return 1;
+}
+
+int omp_get_num_threads(void) {
+  return 1;
+}
+
+int omp_get_thread_num(void) {
+  return 0;
+}
 #endif
 
 #ifdef _OPENMP
