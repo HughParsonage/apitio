@@ -49,6 +49,21 @@
 #include <intrin.h>
 #endif
 
+#if !defined(LIKELY) || !defined(UNLIKELY)
+#  if defined(__has_builtin)
+#    if __has_builtin(__builtin_expect)
+#      define LIKELY(x)   (__builtin_expect(!!(x), 1))
+#      define UNLIKELY(x) (__builtin_expect(!!(x), 0))
+#    endif
+#  endif
+#endif
+
+// Fallback
+#if !defined(LIKELY) || !defined(UNLIKELY)
+#  define LIKELY(x)   (x)
+#  define UNLIKELY(x) (x)
+#endif
+
 /* ---- on-disk structs (packed) ---- */
 #pragma pack(push, 1)
 

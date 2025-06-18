@@ -16,6 +16,8 @@ test_rtsv_ynq(nThread = 1L)
 \item{file.tsv}{A tsv file.}
 
 \item{Schemata}{A schemata produced by \code{\link{field_schemata}}.}
+
+\item{nThread}{Number of OpenMP threads to use.}
 }
 \value{
 The number of rows.

@@ -667,6 +667,9 @@ void RSchema_to_Schemata(SEXP RSchema, FieldSchemata *field_schemata) {
 }
 
 
+
+
+
 SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
 
   AS_NTHREAD
@@ -788,9 +791,6 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
     }
   }
 
-  // uint64_t PARSE_STOP_FLAGS[128] = {0};
-  // uint64_t PARSE_WARN_FLAGS[128] = {0};
-
 
   Table *DT = allocate_table(n_cols, n_rows, Types);
 
@@ -805,8 +805,12 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
   //
   //
   // 1. set up two plain ints (zero = no error yet)
-  int any_fatal = 0;
-  int any_warn  = 0;
+  if (nThread >= 1023) {
+    warning("nThread = %d which is larger than 1023. This is unsupported. Assuming erroneous, defaulting to single-threaded.", nThread);
+    nThread = 1;
+  }
+  uint64_t STOP_FLAGS[1024] = {0};
+  uint64_t WARN_FLAGS[1024] = {0};
 
   // Build up our unchanging parse context
 
@@ -825,6 +829,9 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
 
   const int n_fields = fs->n_field_schemae;
 
+  const char *end = data + len;
+
+
   // 2. hot-path, parallel parse loop only sets those flags
 #ifdef _OMP_APITF
 #pragma omp parallel for num_threads(nThread)
@@ -834,6 +841,9 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
     const char *p = data + start;
 
     for (int fld = 0; fld < n_fields; ++fld) {
+      if (UNLIKELY(STOP_FLAGS[omp_get_thread_num() + 1])) {
+        continue;
+      }
       if (!ctx[fld].active) {
         continue;
       }
@@ -845,24 +855,20 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
         case SCHEMA_ANY:
           break;
         case SCHEMA_YNQ: {
-          // single-byte token, so *p is the value, *(p+1) is TAB or NL
-          unsigned int c = (unsigned char)*p;
-          uint8_t v = map_ynq[c];
-          if (v < 3) {                        // fast path, schema honoured
-            if (v == 2) {                   // NA
-              set_na_in_column_ctx(&ctx[fld], i);
-            } else {
-              bit2_put(ctx[fld].data, i, v);
-            }
-          } else {                            // invalid, flag & set NA
-            __sync_fetch_and_or(
-              s->required ? &any_fatal : &any_warn, 1);
-            set_na_in_column_ctx(&ctx[fld], i);
-          }
-          p += 1;                 // finished value byte
-          if (*p) ++p;            // skip TAB / NL
-          continue;               // go to next field
+          if (LIKELY(p + 1 < end) &&           // safe to read p[1]
+              LIKELY(p[1] == '\t' || p[1] == '\n' || p[1] == '\r')) {
+
+          /* hot path: one byte token */
+          uint8_t v = map_ynq[(unsigned char)*p];
+          bit2_put(ctx[fld].data, i, v < 3 ? v : 3);   // 3 = NA
+          p += 2;
+          continue;
+        } else {
+          STOP_FLAGS[omp_get_thread_num() + 1] = 2;
+          continue;
         }
+        }
+          break;
         case SCHEMA_YN: {
 
         }
@@ -911,7 +917,7 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
         if (v < s->i_min || v > s->i_max) {
           // atomic OR into one of our flags
           __sync_fetch_and_or(
-            s->required ? &any_fatal : &any_warn,
+            s->required ? &STOP_FLAGS[omp_get_thread_num() + 1] : &WARN_FLAGS[omp_get_thread_num() + 1],
             1
           );
           ((int32_t*)buf)[i] = NA_INTEGER;
@@ -935,8 +941,27 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
     }
   }
 
+  bool any_stop = false;
+  bool any_warn = false;
+  bool any_bad_ynq = false;
+  for (int tt = 0; tt < 1024; ++tt) {
+    if (STOP_FLAGS[tt]) {
+      any_stop = true;
+      if (STOP_FLAGS[tt] == 2) {
+        any_bad_ynq = true;
+      }
+    }
+    if (WARN_FLAGS[tt]) {
+      any_warn = true;
+    }
+  }
+
   // 3. after parsing, if either flag is nonzero, do a serial re-scan to emit Rf_error/Rf_warning
-  if (any_fatal || any_warn) {
+  if (any_stop || any_warn) {
+    if (any_bad_ynq) {
+      Rprintf("A YNQ column failed to pass correctly.");
+    }
+
     for (size_t i = 0; i < n_rows; ++i) {
       size_t start = (i == 0 ? data_start : row_offsets[i-1]);
       const char *p = data + start;
