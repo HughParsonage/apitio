@@ -15,6 +15,7 @@
  * @param U            [n_rows]   upper bounds for w_i (NULL to skip)
  * @param eps          convergence tolerance on max|margin−target|
  * @param max_iter     maximum number of full Gauss–Seidel passes
+ * @param max_err_achievd (applicable when the convergence fails)
  * @param w            [n_rows]   OUT: calibrated weights (initialized to d_i)
  *
  * @return number of iterations used (1..max_iter), or -1 if no convergence.
@@ -25,6 +26,7 @@ int gregwt_calibrate(int n_rows, int n_cons,
                      const double *T,
                      const double *L, const double *U,
                      double eps, int max_iter,
+                     double *max_err_achieved,
                      double *w)
 {
   // 1) Allocate and precompute A[c] = Σ_i d_i*q_i*X_ic
@@ -45,11 +47,14 @@ int gregwt_calibrate(int n_rows, int n_cons,
   }
 
   // 2) Initialize w_i = d_i
-  for(int i = 0; i < n_rows; i++)
+  for(int i = 0; i < n_rows; i++) {
     w[i] = d[i];
+  }
 
   // 3) Gauss–Seidel over constraints
+  int iters_performed = -1;
   for(int iter = 1; iter <= max_iter; iter++) {
+    ++iters_performed;
     double max_err = 0.0;
 
     for(int c = 0; c < n_cons; c++) {
@@ -80,10 +85,14 @@ int gregwt_calibrate(int n_rows, int n_cons,
     // 4) enforce bounds (if given)
     if(L && U) {
       for(int i = 0; i < n_rows; i++) {
-        if(w[i] < L[i]) w[i] = L[i];
-        else if(w[i] > U[i]) w[i] = U[i];
+        if(w[i] < L[i]) {
+          w[i] = L[i];
+        } else if (w[i] > U[i]) {
+          w[i] = U[i];
+        }
       }
     }
+    *max_err_achieved = max_err;
 
     // 5) check convergence
     if(max_err <= eps) {
@@ -93,7 +102,7 @@ int gregwt_calibrate(int n_rows, int n_cons,
   }
 
   free(A);
-  return -1;  // no convergence within max_iter
+  return -1 - iters_performed;  // no convergence within max_iter
 }
 
 // Helper: get a column by name from a data.frame/data.table
@@ -170,16 +179,20 @@ SEXP C_fcalibrate_gregwt(SEXP dt, SEXP targetSEXP, SEXP colsSEXP,
   // Enforce strictly positive weights: lower bound = DBL_MIN, no upper bound
   double *L = (double*) R_alloc(n_rows, sizeof(double));
   double *U = (double*) R_alloc(n_rows, sizeof(double));
-  for(int i = 0; i < n_rows; i++) {
-    L[i] = DBL_MIN;
-    U[i] = 100;
+  if (L && U) {
+    for(int i = 0; i < n_rows; i++) {
+      L[i] = 0.001;
+      U[i] = 100;
+    }
   }
 
+  double max_err_achieved = 1;
   // Run GREGWT calibration
   int res = gregwt_calibrate(n_rows, n_cons, X, d, q, T, L, U,
-                             eps, max_iter, w);
-  if(res < 0)
-    warning("Calibration did not converge");
+                             eps, max_iter, &max_err_achieved, w);
+  if (res < 0) {
+    warning("Calibration did not converge (%d iters performed, max_err = %.2f)", -res -1, max_err_achieved);
+  }
 
   // Attach number of iterations as an attribute
   SEXP iters = PROTECT(ScalarInteger(res));
