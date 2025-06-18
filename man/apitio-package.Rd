@@ -6,7 +6,7 @@
 \alias{apitio-package}
 \title{apitio: Australian Personal Income Tax File Input Output}
 \description{
-Create files suitable for high-performance for the Australian personal income tax system
+Create files suitable for high-performance for the Australian personal income tax system. Introduces the idea of a file schemata to assist with faster parsing and richer column classes.
 }
 \author{
 \strong{Maintainer}: Hugh Parsonage \email{hugh.parsonage@gmail.com}

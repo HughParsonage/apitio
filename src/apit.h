@@ -10,6 +10,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #define MAX_COLUMNS 1024
+#define MAX_SUPPORTED_NTHREAD 128
 
 #include <R.h>
 #include <Rinternals.h>
@@ -125,7 +126,8 @@ typedef enum {
   SCHEMA_ANY,
   SCHEMA_YNQ,
   SCHEMA_YN,
-  SCHEMA_MF
+  SCHEMA_MF,
+  SCHEMA_FIVER,
 } SchemaPreset;
 
 static const char CHAR_YNQ[3] = {'?', 'N', 'Y'};
@@ -170,6 +172,31 @@ typedef struct {
   int n_field_schemae;
 } FieldSchemata;
 
+typedef enum {
+  ERR_NONE,               // no error
+  ERR_MISSING_COLUMN,     // required header not found
+  ERR_TYPE_MISMATCH,      // token couldn’t be parsed into the declared type
+  ERR_OUT_OF_RANGE,       // numeric or date value outside [min,max]
+  ERR_INVALID_ENUM,       // token not in the allowed set of strings (e.g. not 'Y','N','?')
+  ERR_IRREGULAR_SHAPE,    // wrong number of fields on a row
+  ERR_EXTRA_COLUMN,       // unexpected extra column
+} ErrorCode;
+
+typedef struct {
+  ErrorCode code;
+  bool critical; // Should a parallel region stop?
+  bool fatal;
+  R_xlen_t row_pos;
+  int col_index;
+} ErrorRegister;
+
+typedef struct {
+  ErrorRegister MasterRegister;
+  ErrorRegister Z[MAX_SUPPORTED_NTHREAD];
+} ErrorRegisters;
+
+
+
 /* ---- page-align helper ---- */
 static inline uint64_t round_up_4k(uint64_t x) {
   return (x + 4095u) & ~4095u;
@@ -180,7 +207,7 @@ static inline bool is_digit(char c) {
 }
 
 static inline const char * do_parse_int32_fast(const char *p, int32_t *out) {
-  int32_t v = 0;
+  int64_t v = 0;
   bool neg = (*p == '-');
   if (neg) ++p;
 
@@ -193,7 +220,7 @@ static inline const char * do_parse_int32_fast(const char *p, int32_t *out) {
 }
 
 static inline const char * parse_nonneg_int32_fast(const char *p, int32_t *out) {
-  int32_t v = 0;
+  int64_t v = 0;
 
   /* unrolled 16-digit loop handles 99.9 % of tax data */
   while (is_digit(*p)) v = v * 10 + (*p++ - '0');
@@ -215,6 +242,71 @@ static inline const char * parse_ynq(const char *p, int *out) {
     *out = -1;
   }
   return p + 1;
+}
+
+static inline const char *parse_dec2_scaled(const char *p,
+                                            int32_t *out,
+                                            bool *ok,
+                                            bool nonneg) {
+  // NA detection
+  if (*p == '\t' || *p == '\n' || *p == '\r') {   // empty field
+    *ok = true;
+    *out = NA_INTEGER;
+    return *p ? p + 1 : p;
+  }
+  if (*p == '?' && (p[1] == '\t' || p[1] == '\n' || p[1] == '\r' || p[1] == 0)){
+    *ok = true;
+    *out = NA_INTEGER;
+    return p + 1 + !!p[1];
+  }
+
+  // Determine sign
+  bool neg = false;
+  if (*p == '-') {
+    neg = true;
+    ++p;
+  } else if (*p == '+') {
+    ++p;
+  }
+  if (nonneg && neg) {
+    *ok = false;
+    return p;
+  }
+
+  // integer part
+  int32_t major = 0;
+  if (!is_digit(*p)) {
+    *ok = false;
+    return p;
+  }
+  do {
+    major = major*10 + (*p - '0');
+  } while (is_digit(*++p));
+
+  int frac = 0; // [00 , 99]
+  if (*p == '.') {
+    ++p;
+    if (!is_digit(*p)) {
+      bool next_is_sep= (*p == '\t' || *p == '\r' || *p == '\n');
+      *ok = next_is_sep;
+      return p + next_is_sep;
+    }
+    frac = (*p - '0') * 10;          // 1st dp
+    ++p;
+    if (is_digit(*p)) {              // optional 2nd dp
+      frac += (*p - '0');
+      ++p;
+      if (is_digit(*p)) { *ok = false; return p; } // >2 dp → invalid
+    }
+  }
+
+  if (*p && *p != '\t' && *p != '\n' && *p != '\r') {
+    *ok = false;
+    return p;
+  }
+  *out = (major*100 + frac) * (neg ? -1 : 1);
+  *ok  = true;
+  return *p ? p + 1 : p;
 }
 
 static inline void bitset_put(uint8_t *dst, uint64_t idx, bool val) {

@@ -27,9 +27,14 @@ void tictok(const char * msg, clock_t * t0) {
   t0[0] = t;
 }
 
-static inline void bit2_put(uint8_t *dst, uint64_t idx, uint8_t v)
-  /* v in 0…3 */
-{
+static inline void bit1_put(uint8_t *dst, uint64_t idx, uint8_t v) {
+  uint64_t byte  = idx >> 3;         // 8 values per byte
+  unsigned shift = idx & 7;          // 0..7
+  dst[byte] &= ~(1u << shift);       // clear the target bit
+  dst[byte] |=  (v & 1u) << shift;   // set it to (v & 1)
+}
+
+static inline void bit2_put(uint8_t *dst, uint64_t idx, uint8_t v) {
   uint64_t byte = idx >> 2;          // 4 values / byte
   unsigned shift = (idx & 3) * 2;    // 0,2,4,6
   dst[byte]  &= ~(3u << shift);      // clear
@@ -805,8 +810,8 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
   //
   //
   // 1. set up two plain ints (zero = no error yet)
-  if (nThread >= 1023) {
-    warning("nThread = %d which is larger than 1023. This is unsupported. Assuming erroneous, defaulting to single-threaded.", nThread);
+  if (nThread >= MAX_SUPPORTED_NTHREAD) {
+    warning("nThread = %d which is >= than %d. Usupported. Assuming erroneous, defaulting to single-threaded.", nThread, MAX_SUPPORTED_NTHREAD);
     nThread = 1;
   }
   uint64_t STOP_FLAGS[1024] = {0};
@@ -834,17 +839,31 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
 
   // 2. hot-path, parallel parse loop only sets those flags
 #ifdef _OMP_APITF
-#pragma omp parallel for num_threads(nThread)
+#pragma omp parallel num_threads(nThread)
 #endif
+{
+bool stop_flag = false;
+#pragma omp for
   for (size_t i = 0; i < n_rows; ++i) {
+    if (UNLIKELY(stop_flag)) {
+      continue;
+    }
     size_t start = (i == 0 ? data_start : row_offsets[i - 1]);
     const char *p = data + start;
 
     for (int fld = 0; fld < n_fields; ++fld) {
-      if (UNLIKELY(STOP_FLAGS[omp_get_thread_num() + 1])) {
+      if (UNLIKELY(stop_flag)) {
         continue;
       }
       if (!ctx[fld].active) {
+        // Skip until we hit a delimiter (or end of buffer):
+        while (p < end && *p != '\t' && *p != '\n' && *p != '\r') {
+          p++;
+        }
+        // If still in bounds, skip the delimiter itself
+        if (p < end) {
+          ++p;
+        }
         continue;
       }
 
@@ -854,28 +873,46 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
         switch(s->preset) {
         case SCHEMA_ANY:
           break;
-        case SCHEMA_YNQ: {
+        case SCHEMA_YNQ:
           if (LIKELY(p + 1 < end) &&           // safe to read p[1]
               LIKELY(p[1] == '\t' || p[1] == '\n' || p[1] == '\r')) {
 
-          /* hot path: one byte token */
-          uint8_t v = map_ynq[(unsigned char)*p];
-          bit2_put(ctx[fld].data, i, v < 3 ? v : 3);   // 3 = NA
-          p += 2;
+            /* hot path: one byte token */
+            uint8_t v = map_ynq[(unsigned char)*p];
+            bit2_put(ctx[fld].data, i, v < 3 ? v : 3);   // 3 = NA
+            p += 2;
+          } else {
+            stop_flag = true;
+          }
           continue;
-        } else {
-          STOP_FLAGS[omp_get_thread_num() + 1] = 2;
+        case SCHEMA_YN:
+          if (LIKELY(p + 1 < end) &&
+              LIKELY(p[0] == 'Y' || p[0] == 'N') &&
+              LIKELY(p[1] == '\t' || p[1] == '\n' || p[1] == '\r')) {
+            bit1_put(ctx[fld].data, i, *p == 'Y');
+            p += 2;
+          } else {
+            stop_flag = true;
+          }
           continue;
-        }
-        }
-          break;
-        case SCHEMA_YN: {
+        case SCHEMA_MF:
+          if (LIKELY(p + 1 < end) &&
+              LIKELY(p[0] == 'M' || p[0] == 'F') &&
+              LIKELY(p[1] == '\t' || p[1] == '\n' || p[1] == '\r')) {
+            bit1_put(ctx[fld].data, i, *p == 'M');
+            p += 2;
+          } else {
+            stop_flag = true;
+          }
+          continue;
+        case SCHEMA_FIVER:
+          if (LIKELY(p + 1 < end)) {
+            if (p[0] == '5' && p[1] == '\t') {
 
-        }
-        case SCHEMA_MF: {
-
-        }
-
+            }
+          } else {
+            stop_flag = true;
+          }
         }
       }
 
@@ -927,6 +964,11 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
       }
         break;
         // other TYPE cases identical to before, but only OR the flags
+      case TYPE_DOUBL: {
+        double v = 0;
+
+      }
+
       default:
         do {
         while (*p && *p != '\t' && *p != '\n' && *p != '\r') {
@@ -940,6 +982,7 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
       }
     }
   }
+} // end of parallel region
 
   bool any_stop = false;
   bool any_warn = false;
@@ -1003,6 +1046,282 @@ SEXP C_read_tsv_with_schemata(SEXP FileTsv, SEXP RSchema, SEXP nthreads) {
   free_table(DT);
   free(ctx);
   return ScalarReal(n_rows);
+}
+
+SEXP C_file_has_high_bit(SEXP FileTsv) {
+  // Can be any file, not just tsv
+  if (!isString(FileTsv) || !xlength(FileTsv)) {
+    error("FileTsv must be a STRSXP");
+  }
+  if (STRING_ELT(FileTsv, 0) == NA_STRING) {
+    error("FileTsv[1] is NA");
+  }
+  const char *path = CHAR(STRING_ELT(FileTsv, 0));
+
+  size_t len = 0;
+  char* data = map_file(path, &len);
+  if (!data) {
+    error("Unable to open or map (mmap) file %s", path);
+  }
+  if (!len) {
+    unmap_file(data, len);
+    return ScalarLogical(NA_LOGICAL);
+  }
+  bool ans = false;
+#pragma omp parallel for reduction(||:ans)
+  for (size_t i = 0; i < len; ++i) {
+    if (ans) {
+      continue;
+    }
+    unsigned char c_i = data[i];
+    if (c_i >= 128) {
+      ans = true;
+    }
+  }
+  unmap_file(data, len);
+  return ScalarLogical(ans);
+}
+
+SEXP C_count_low_bits(SEXP FileTsv) {
+  // Can be any file, not just tsv
+  if (!isString(FileTsv) || !xlength(FileTsv)) {
+    error("FileTsv must be a STRSXP");
+  }
+  if (STRING_ELT(FileTsv, 0) == NA_STRING) {
+    error("FileTsv[1] is NA");
+  }
+  const char *path = CHAR(STRING_ELT(FileTsv, 0));
+
+  size_t len = 0;
+  char* data = map_file(path, &len);
+  if (!data) {
+    error("Unable to open or map (mmap) file %s", path);
+  }
+  if (!len) {
+    unmap_file(data, len);
+    return ScalarLogical(NA_LOGICAL);
+  }
+
+  uint64_t count[128] = {0};
+#pragma omp parallel for num_threads(8) reduction(+:count[:128])
+  for (size_t i = 0; i < len; ++i) {
+    unsigned int c = (unsigned char)data[i];
+    count[c]++;
+  }
+  unmap_file(data, len);
+  SEXP ans = PROTECT(allocVector(REALSXP, 128));
+  for (int j = 0; j < 128; ++j) {
+    REAL(ans)[j] = count[j];
+  }
+  UNPROTECT(1);
+
+  return ans;
+}
+
+
+bool all_crlf_pairs_omp(const char *data, size_t len, int nThread) {
+  if (len < 2) return true;
+
+  int any_violation = 0;
+
+#pragma omp parallel num_threads(nThread)
+{
+  int tid = omp_get_thread_num();
+  int nthreads = omp_get_num_threads();
+
+  size_t chunk_size = (len + nthreads - 1) / nthreads;
+  size_t start = tid * chunk_size;
+  size_t end   = (tid + 1) * chunk_size;
+  if (end > len) end = len;
+
+  // Adjust to ensure safe reads at i-1 and i+1
+  if (start > 0) start--;               // allow safe i-1
+  if (end + 32 < len) end += 32;        // allow safe i+1 inside AVX block
+
+  const __m256i vCR = _mm256_set1_epi8('\r');
+  const __m256i vLF = _mm256_set1_epi8('\n');
+
+  size_t i = start + 2;
+
+  while (i + 32 + 1 <= end) {
+    if (any_violation) break;
+
+    const char *p = data + i;
+    __m256i block = _mm256_loadu_si256((const __m256i*)(p));
+    __m256i next  = _mm256_loadu_si256((const __m256i*)(p + 1));
+    __m256i prev  = _mm256_loadu_si256((const __m256i*)(p - 1));
+
+    __m256i is_cr = _mm256_cmpeq_epi8(block, vCR);
+    __m256i after = _mm256_cmpeq_epi8(next,  vLF);
+    __m256i bad1  = _mm256_andnot_si256(after, is_cr);
+
+    __m256i is_lf = _mm256_cmpeq_epi8(block, vLF);
+    __m256i before= _mm256_cmpeq_epi8(prev,  vCR);
+    __m256i bad2  = _mm256_andnot_si256(before, is_lf);
+
+    if (UNLIKELY(_mm256_movemask_epi8(bad1) || _mm256_movemask_epi8(bad2))) {
+#pragma omp atomic write
+      any_violation = 1;
+      break;
+    }
+    i += 32;
+  }
+
+  // Scalar fallback: safe tail (up to len - 1)
+  if (!any_violation) {
+    size_t j = i > 0 ? i - 1 : 0;
+    size_t safe_end = end < len ? end : len;
+    for (; j < safe_end - 1; ++j) {
+      if (data[j] == '\r' && data[j + 1] != '\n') {
+#pragma omp atomic write
+        any_violation = 1;
+        break;
+      }
+      if (data[j + 1] == '\n' && data[j] != '\r') {
+#pragma omp atomic write
+        any_violation = 1;
+        break;
+      }
+    }
+  }
+}
+
+return !any_violation;
+}
+
+bool naive_crlf(const char *data, size_t len, int nThread) {
+
+  if (data[0] == '\n') {
+    return false;
+  }
+  if (len < 2) {
+    return true;
+  }
+  bool bad = false;
+
+#pragma omp parallel for num_threads(nThread) reduction(||:bad)
+  for (size_t i = 1; i < len - 1; ++i) {
+    if (data[i] == '\r') {
+      if (data[i + 1] != '\n') {
+        bad = true;
+      }
+    } else if (data[i] == '\n') {
+      if (data[i - 1] != '\r') {
+        bad = true;
+      }
+    }
+  }
+  if (data[len - 1] == '\r') {
+    return false;
+  }
+
+  return !bad;
+}
+
+
+
+
+SEXP C_everyCR_iff_BR(SEXP FileTsv, SEXP nthreads) {
+  AS_NTHREAD
+  if (!isString(FileTsv) || !xlength(FileTsv)) {
+    error("FileTsv must be a STRSXP");
+  }
+  if (STRING_ELT(FileTsv, 0) == NA_STRING) {
+    error("FileTsv[1] is NA");
+  }
+  const char *path = CHAR(STRING_ELT(FileTsv, 0));
+
+  size_t len = 0;
+  char* data = map_file(path, &len);
+  if (!data) {
+    error("Unable to open or map (mmap) file %s", path);
+  }
+  if (!len) {
+    unmap_file(data, len);
+    return ScalarLogical(NA_LOGICAL);
+  }
+
+  bool r_implies_n = true;
+  bool any_r = false;
+
+  for (size_t i = 0; i < len - 1; ++i) {
+    if (data[i] == '\n') {
+      break;
+    }
+    if (data[i] == '\r') {
+      any_r = true;
+      if (data[i + 1] != '\n') {
+        r_implies_n = false;
+        break;
+      } else {
+        break;
+      }
+    }
+  }
+  if (!any_r) {
+    unmap_file(data, len);
+    return ScalarLogical(NA_LOGICAL);
+  }
+  if (!r_implies_n) {
+    unmap_file(data, len);
+    return ScalarLogical(0);
+  }
+
+  bool ans = all_crlf_pairs_omp(data, len, nThread);
+  // bool ans = naive_crlf(data, len, nThread);
+
+
+
+  unmap_file(data, len);
+  return ScalarLogical(ans);
+}
+
+SEXP C_check_YNQ_Rvec(SEXP x, SEXP nthreads) {
+  if (!isString(x)) {
+    error("x must be a string.");
+  }
+  AS_NTHREAD
+
+  const SEXP *xp = STRING_PTR_RO(x);
+  R_xlen_t N = xlength(x);
+  SEXP ans = PROTECT(allocVector(LGLSXP, N));
+  int * restrict ansp = LOGICAL(ans);
+
+  bool any_bad[MAX_SUPPORTED_NTHREAD] = {0};
+
+#pragma omp parallel for num_threads(nThread)
+for (R_xlen_t i = 0; i < N; ++i) {
+    if (any_bad[omp_get_thread_num()] || xp[i] == NA_STRING || length(xp[i]) != 1) {
+      any_bad[omp_get_thread_num()] = 1;
+      continue;
+    }
+    const char * xi = CHAR(xp[i]);
+    if (xi[0] == 'Y') {
+      ansp[i] = 1;
+      continue;
+    }
+    if (xi[0] == 'N') {
+
+      ansp[i] = 0;
+      continue;
+    }
+    if (xi[0] == '?') {
+      ansp[i] = NA_LOGICAL;
+      continue;
+    }
+    any_bad[omp_get_thread_num()] = 1;
+  }
+
+  for (int j = 0; j < MAX_SUPPORTED_NTHREAD; ++j) {
+    if (any_bad[j]) {
+      UNPROTECT(1);
+      error("nope");
+    }
+  }
+  UNPROTECT(1);
+  return ans;
+
+
 }
 
 
